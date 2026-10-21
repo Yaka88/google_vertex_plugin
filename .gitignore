@@ -1,0 +1,7 @@
+node_modules/
+*.log
+*.tmp
+*sa-key*.json
+.env
+.env.*
+coverage/
