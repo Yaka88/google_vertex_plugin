@@ -1,11 +1,11 @@
 {
   "name": "@magpie-community/gcp-ai",
   "version": "0.1.0",
-  "description": "Google Cloud promotional credits for Magpie, read from the Console with an existing ADC or gcloud sign-in",
+  "description": "Vertex models and Google Cloud promotional credits in Magpie, with your own ADC or gcloud sign-in",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
-  "files": ["index.mjs", "lib/", "assets/", "README.md"],
+  "files": ["index.mjs", "lib/", "assets/", "README.md", "LICENSE"],
   "engines": { "node": ">=22" },
   "scripts": {
     "check": "node --check index.mjs && node --check lib/browser.mjs && node --check lib/credentials.mjs && node --check lib/credits.mjs && node --check lib/endpoint.mjs && node --check lib/models.mjs && node --check lib/fetch_credits.mjs",
@@ -16,5 +16,8 @@
     "credentials": "node lib/fetch_credits.mjs credentials"
   },
   "dependencies": { "playwright-core": "^1.56.0" },
-  "keywords": ["magpie", "gcp-ai", "gcp", "vertex", "credits", "usage", "quota"]
+  "keywords": ["opencode", "opencode-plugin", "magpie", "gcp-ai", "gcp", "vertex", "credits", "usage", "quota"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Yaka88/google_vertex_plugin.git" },
+  "magpie": { "icon": "https://raw.githubusercontent.com/Yaka88/google_vertex_plugin/main/assets/icon.png" }
 }
