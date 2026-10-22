@@ -1,76 +1,66 @@
-# GCP AI — Google Cloud 赠金与 Vertex 模型（Magpie 插件）
+# GCP AI — Google Cloud credits and Vertex models (Magpie plugin)
 
-用你自己的 Google 账号登录一次，Magpie 里就会多出一行 **GCP AI**：
+- **Models**: only the Vertex models your project can actually call, newest first.
+- **Inference**: requests are signed with your local gcloud / ADC credentials and billed to your own project.
+- **Credits**: the quota panel shows the Google Cloud promotional credit balance and its expiry date.
 
-- **模型**：只列出你的项目实际能调用的 Vertex 模型，最新的排在最前面；
-- **推理**：请求用你本机的 gcloud / ADC 凭证签名，账单进你自己的项目；
-- **额度**：额度面板里显示 Google Cloud 的促销赠金（Promotional Credits）余额和到期时间。
+You sign in once with your own Google account. No service accounts, no JSON keys.
 
-不需要创建服务账号，也不需要下载 JSON 私钥。这一行和 Magpie 内置的 **Google Vertex AI** 行互不相干。
+## Requirements
 
-## 准备
+- Google Chrome or Chromium
+- Google Cloud CLI (`gcloud`), already working
+- A Google Cloud project with Vertex AI enabled
+- Reading credits needs permission to view the project's billing account (usually `billing.viewer`)
 
-- Google Chrome 或 Chromium
-- Google Cloud CLI（`gcloud`），已经能正常使用
-- 一个启用了 Vertex AI 的 Google Cloud 项目
-- 查看赠金需要该账号对结算账号有查看权限（通常是 `billing.viewer`）
+## Install and sign in
 
-## 安装与登录
+Run this inside the plugin directory
 
 ```bash
-magpie plugin add /home/yaka/Documents/google_vertex_plugin
+magpie plugin add .
 ```
 
-然后在 Providers 页面找到 **GCP AI** 点登录，或者：
+Then click sign in on the **GCP AI** row in the Providers page, or:
 
 ```bash
 magpie plugin login gcp-ai
 ```
 
-会打开一个 Chrome 窗口，用你的 Google 账号登录即可：
+- **First sign-in** opens a Chrome window and uses the Google account Chrome is already signed in to. If the machine has no ADC yet, the plugin also has gcloud write it from this window, so you never sign in twice.
+- **Adding another account** is the same button again: the plugin opens Google's "add another account" page. An account that differs from the ones already here is added; the same account again adds nothing and says so.
+- Each account keeps its own ADC directory (`~/.config/gcp-adc-<account>`), so two credentials coexist. The first account keeps using gcloud's default directory (`~/.config/gcloud`) if it is already there.
+- The window closes by itself when the sign-in is done. Cookies stay in the Chrome profile (default `~/.config/gcp-auto-profile`) and are reused for credit reads.
+- Authorization codes and tokens are handled by gcloud alone; the plugin never touches refresh tokens or client secrets.
 
-- **第一次登录**直接用 Chrome 当前已登录的账号；电脑上还没有 ADC 时，插件会在这个窗口里顺带完成 gcloud 的 ADC 授权，不用登录两次。
-- **再加一个账号**时再点一次登录，插件会打开 Google 的「添加其他账号」页面。登录进来的账号与已有的不同才会新增；还是原来那个则不新增，直接提示已经登录过。
-- 每个账号有独立的 ADC 目录（`~/.config/gcp-adc-<账号>`），互不覆盖；第一个账号如果已在默认目录 `~/.config/gcloud` 里，就继续用那一份。
-- 登录完成后窗口自动关闭，Cookie 保存在 Chrome 配置目录里（默认 `~/.config/gcp-auto-profile`），读取赠金时复用。
-- 授权码和令牌都由 gcloud 自己处理，插件不接触 refresh token 或 client secret。
+## FAQ
 
-## 用起来
+**No credits shown?** The Chrome sign-in has usually expired; sign in again.
 
-- **模型**：只显示项目能调用的模型。下拉里没有的，通常是项目没开 Vertex AI，或该模型在对应区域不可用。
-- **额度**：例如 `$309.98 remaining / $310.00 USD`，以及最近一笔到期时间。
-- **项目**：默认取登录时 Cloud Console 当前打开的项目，模型和赠金不会跑到两个项目上。
-
-## 常见问题
-
-**赠金显示不出来？** 多半是 Chrome 里的登录过期了，重新登录一次即可。
-
-**想换项目或区域？** 项目默认从 Console 读取，也可以用环境变量指定：
+**Changing project or region?** The project is read from the Console by default; both can be set explicitly:
 
 ```bash
 export GOOGLE_VERTEX_PROJECT=your-project-id
 export GOOGLE_VERTEX_LOCATION=global
 ```
 
-**授权页上账号不对？** 同意页可能默认选中 Chrome 里的另一个账号。插件会核对授权后的账号，不一致就什么都不保存，并删掉这次刚写的 ADC 目录；重新登录、在同意页上选对账号即可。
+**Wrong account on the consent page?** Google may preselect another account in Chrome. The plugin checks the account the credentials actually belong to; on a mismatch it saves nothing and removes the ADC directory this run created. Sign in again and pick the right account on the consent page.
 
-**余额和账单页对不上？** 赠金是结算账号级别的，可能被多个项目共享，控制台本身也有结算延迟。
+**Credits don't match the billing page?** Promotional credits belong to the billing account and can be shared across projects, and the Console itself has billing latency.
 
-**为什么设置里没有项目/区域输入框？** 插件形式的 Provider 不能自定义表单字段，这两项自动推导（或用上面的环境变量覆盖）。
+## Configuration
 
-## 可配置项
-
-| 环境变量 | 含义 / 默认值 |
+| Environment variable | Meaning / default |
 | --- | --- |
-| `GOOGLE_VERTEX_PROJECT` | 项目 ID，默认从 Console 读取 |
-| `GOOGLE_VERTEX_LOCATION` | 区域，默认 `global` |
-| `VERTEX_BILLING_ACCOUNT` | 账单账号 ID，默认按项目自动查找 |
-| `VERTEX_CHROME_PROFILE` | Chrome 配置目录，默认 `~/.config/gcp-auto-profile` |
-| `VERTEX_CHROME_PATH` | Chrome / Chromium 可执行文件路径 |
-| `VERTEX_GCLOUD_ACCOUNT` | 指定使用的 Google 账号 |
-| `VERTEX_GCLOUD_AUTH_MODE` | `auto`（默认）、`adc` 或 `gcloud` |
-| `CLOUDSDK_CONFIG` | gcloud 配置目录，默认 `~/.config/gcloud`；多账号时按账号自动分配 |
+| `GOOGLE_VERTEX_PROJECT` | Project ID; read from the Console by default |
+| `GOOGLE_VERTEX_LOCATION` | Region, default `global` |
+| `VERTEX_BILLING_ACCOUNT` | Billing account ID; looked up from the project by default |
+| `VERTEX_CHROME_PROFILE` | Chrome profile directory, default `~/.config/gcp-auto-profile` |
+| `VERTEX_CHROME_PATH` | Chrome / Chromium executable path |
+| `VERTEX_GCLOUD_ACCOUNT` | Google account to use |
+| `VERTEX_GCLOUD_AUTH_MODE` | `auto` (default), `adc` or `gcloud` |
+| `CLOUDSDK_CONFIG` | gcloud config directory, default `~/.config/gcloud`; assigned per account when several exist |
 
-## 隐私
+## Privacy
 
-插件只做这些事：用你的凭证向 Google 请求模型列表和免费计数、向 Vertex 端点发送推理请求、用本机 Chrome 打开 Cloud Console 读取赠金页面。没有第三方服务器，不上传凭证，不会把网页 Cookie 转成令牌。
+The plugin only does this: asks Google for the model list and a free token count with your credentials, sends inference requests to the Vertex endpoint, and opens Cloud Console in your local Chrome to read the credits page. No third-party server, no credential upload, and page cookies are never turned into tokens.

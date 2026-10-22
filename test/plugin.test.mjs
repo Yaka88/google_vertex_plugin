@@ -284,7 +284,7 @@ test("Chrome login reuses terminal credentials, closes its window afterwards, an
             // (projectInConsole) and who it belongs to (accountInPage). Both
             // answer from the one page this test loads.
             const source = String(fn)
-            if (source.includes("gserviceaccount")) return { jsonValue: async () => "yehappy28@gmail.com", dispose: async () => {} }
+            if (source.includes("gserviceaccount")) return { jsonValue: async () => "signed-in@example.com", dispose: async () => {} }
             if (source.includes("last_project_id")) return { jsonValue: async () => "adc-project", dispose: async () => {} }
             return { jsonValue: async () => ({ text: answers.shift() ?? "Google Cloud Console" }), dispose: async () => {} }
           },
@@ -309,7 +309,7 @@ test("Chrome login reuses terminal credentials, closes its window afterwards, an
       // nothing navigates again just to re-ask what it already answered.
       if (!denied) {
         assert.equal(visited.searchParams.get("project"), null)
-        assert.equal(result.account, "yehappy28@gmail.com")
+        assert.equal(result.account, "signed-in@example.com")
       }
     }
     assert.ok(!(await fixture.calls()).some((args) => args.includes("login")))
