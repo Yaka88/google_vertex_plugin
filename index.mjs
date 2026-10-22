@@ -3,7 +3,7 @@ import { defaultProfile, validateProject } from "./lib/browser.mjs"
 import { resolveIdentity, startLogin, tokenProvider, accountOf } from "./lib/credentials.mjs"
 import { fetchCredits, usageOf } from "./lib/credits.mjs"
 import { testEndpoint } from "./lib/endpoint.mjs"
-import { providerModels } from "./lib/models.mjs"
+import { providerModels, seedModels } from "./lib/models.mjs"
 
 // This plugin is its own provider: Magpie's built-in Vertex row keeps its own
 // project, location and ADC path, and nothing here touches it. What the plugin
@@ -78,12 +78,15 @@ export const GoogleVertexAuthPlugin = async (input = {}) => {
   const client = input.client
   let configured = {}
   return {
-    // Only the row's own name and protocol: the models hook supplies the list.
+    // The row's name, protocol and startup list. These models are a seed: the
+    // provider hook replaces them with what the project can actually call once
+    // an account is signed in, so this never overstates a project's access.
     config: async (config) => {
       config.provider ??= {}
       const provider = config.provider[ID] ??= {}
       provider.name ??= "GCP AI"
       provider.npm ??= "@ai-sdk/openai-compatible"
+      provider.models = { ...seedModels(), ...(provider.models ?? {}) }
       configured = provider
     },
     provider: {

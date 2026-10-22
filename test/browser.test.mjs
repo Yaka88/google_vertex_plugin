@@ -6,7 +6,16 @@ import test from "node:test"
 import { assertConsoleSession, extractProjectId, openBrowser } from "../lib/browser.mjs"
 import { discoverBillingAccount, fetchCredits, usageOf } from "../lib/credits.mjs"
 
-test("Console session waits for passive sign-in, rejects persistent forms, and handles a closed page", async () => {
+// These two tests drive a real Chrome, so they need the plugin's one runtime
+// dependency installed. A checkout that never ran `bun install` can still load
+// the plugin and its hooks; it just cannot open a browser, and says so here
+// rather than failing as a broken test.
+const installed = await import("playwright-core").then(() => true, () => false)
+const needsBrowser = { skip: installed ? false : "playwright-core is not installed (run bun install)" }
+
+// The timeout is stated because this test waits out a real passive sign-in
+// redirect: two seconds beyond the default a runner like Bun gives a test.
+test("Console session waits for passive sign-in, rejects persistent forms, and handles a closed page", { timeout: 30000, ...needsBrowser }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "vertex-browser-session-"))
   let browser
   try {
@@ -56,7 +65,7 @@ test("Console session waits for passive sign-in, rejects persistent forms, and h
   }
 })
 
-test("Chrome credits scrape handles pagination, keeps cache isolated, and force refresh bypasses it", async () => {
+test("Chrome credits scrape handles pagination, keeps cache isolated, and force refresh bypasses it", needsBrowser, async () => {
   const directory = await mkdtemp(join(tmpdir(), "vertex-browser-credits-"))
   const previousCache = process.env.XDG_CACHE_HOME
   let browser
