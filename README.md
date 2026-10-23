@@ -1,4 +1,4 @@
-# GCP AI — Google Cloud credits and Vertex models (Magpie plugin)
+# GCP AI — Google Cloud credits and Vertex models (Magpie / OpenCode plugin)
 
 - **Models**: the Vertex chat models your project can call, newest first.
 - **Inference**: requests are signed with your local gcloud / ADC credentials and billed to your own project.
