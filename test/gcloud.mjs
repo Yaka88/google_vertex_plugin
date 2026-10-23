@@ -16,8 +16,22 @@ const state = JSON.parse(readFileSync(process.env.VERTEX_TEST_GCLOUD, "utf8"))
 const args = process.argv.slice(2)
 appendFileSync(state.log, JSON.stringify(args) + "\\n")
 if (state.fail) { process.stderr.write("SECRET-ERROR-OUTPUT"); process.exit(1) }
+// A token belongs to the account whose ADC is in the directory it is read
+// from. An ADC login writes that account beside the file it writes, so the
+// token still names the right account after the directory is renamed.
+const written = (() => {
+  try { return readFileSync(process.env.CLOUDSDK_CONFIG + "/.fixture-account", "utf8").trim() } catch { return undefined }
+})()
+// ADC's token command fails when the directory holds no ADC, as gcloud's does.
+// A gcloud-user token (--account=...) does not depend on ADC.
+const hasAdc = (() => {
+  try { readFileSync(process.env.CLOUDSDK_CONFIG + "/application_default_credentials.json"); return true } catch { return false }
+})()
 if (args[0] === "config") console.log(state[args[2]] ?? "(unset)")
-else if (args.includes("print-access-token")) console.log(state.tokens?.[process.env.CLOUDSDK_CONFIG] ?? state.token ?? "fixture-token")
+else if (args.includes("print-access-token")) {
+  if (!args.some((arg) => arg.startsWith("--account=")) && !hasAdc) { process.stderr.write("no ADC in this directory"); process.exit(1) }
+  console.log(written ?? state.tokens?.[process.env.CLOUDSDK_CONFIG] ?? state.token ?? "fixture-token")
+}
 // An ADC login is gcloud's own: the fixture only writes the file, into the
 // directory it was pointed at, as the real one does.
 else if (args[0] === "auth" && args[1] === "application-default" && args[2] === "login") {
@@ -25,9 +39,14 @@ else if (args[0] === "auth" && args[1] === "application-default" && args[2] === 
   const { join } = await import("node:path")
   // state.approved is who Google's consent page is approved as, which the
   // address the plugin opened asks for as authuser.
-  const approved = state.approved?.[process.env.CLOUDSDK_CONFIG] ?? state.approved
+  const approved = state.approved?.[process.env.CLOUDSDK_CONFIG] ?? state.approved ?? state.pendingToken
   mkdirSync(process.env.CLOUDSDK_CONFIG, { recursive: true })
   writeFileSync(join(process.env.CLOUDSDK_CONFIG, "application_default_credentials.json"), JSON.stringify({ type: "authorized_user", client_id: "id", client_secret: "secret", refresh_token: "refresh", approved }))
+  // Who this directory's token now belongs to. It travels with the directory,
+  // as gcloud's credentials do, so a rename does not change the answer.
+  if (approved) writeFileSync(join(process.env.CLOUDSDK_CONFIG, ".fixture-account"), approved)
+  process.stderr.write("Your browser has been opened to visit:\\n\\n    https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=x&state=y\\n\\n")
+  process.exit(0)
 }
 else process.exit(2)
 `, { mode: 0o700 })

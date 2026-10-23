@@ -78,9 +78,12 @@ export const GoogleVertexAuthPlugin = async (input = {}) => {
   const client = input.client
   let configured = {}
   return {
-    // The row's name, protocol and startup list. These models are a seed: the
-    // provider hook replaces them with what the project can actually call once
-    // an account is signed in, so this never overstates a project's access.
+    // The row's name, protocol and the list it starts with. Magpie lists a
+    // plugin provider from what this hook gives it, so a row configured with no
+    // models stays empty until someone presses Fetch models; the seed is
+    // Google's current catalog so the row is usable before it is signed in.
+    // The provider hook below replaces it with what the signed-in project can
+    // actually call, which is also where retired models are left out.
     config: async (config) => {
       config.provider ??= {}
       const provider = config.provider[ID] ??= {}
@@ -93,32 +96,42 @@ export const GoogleVertexAuthPlugin = async (input = {}) => {
       id: ID,
       // The host asks once per account and hands that account's sign-in in;
       // asking without it would list the first account's models for all of
-      // them. A list Google can't be asked for is not replaced with a guess:
-      // the row keeps the models it had rather than offer ones the project
-      // can't call.
-      models(_models, context) { return providerModels(settings(configured, context?.auth), ID) },
+      // them. This is where the list is read, from Google, with that account's
+      // credentials — nobody has to press Fetch models first. A list Google
+      // can't be asked for is not replaced with a guess: the row keeps the
+      // models it had rather than offer ones the project can't call.
+      //
+      // The first argument is the whole provider info, not its models — it
+      // carries id, name, source and the rest beside `models`. Handing that
+      // object back on failure made the host read its keys as model ids and
+      // list "id", "name" and "source" as models, so only provider.models is
+      // ever given back.
+      async models(provider, context) {
+        try { return await providerModels(settings(configured, context?.auth), ID) }
+        catch { return provider?.models ?? {} }
+      },
     },
     auth: {
       provider: ID,
       ...(icon ? { icon } : {}),
       methods: [{
         type: "oauth", label: "Google Cloud ADC / gcloud account (Chrome for credits)",
-        // Nothing is asked before the window opens. A first sign-in uses the
-        // Google account Chrome is already signed in to; a sign-in on a machine
-        // that already has an account opens Google's add-another-account page,
-        // so a second account is added without typing an address.
+        // The first account on a machine opens gcloud's consent page directly;
+        // a later one opens Google's add-account page first so the account can
+        // be picked. Both continue in the same window, and gcloud's exit tells
+        // the plugin when to close it; the person never closes it themselves.
         async authorize() {
           const options = settings(configured)
           const login = await startLogin(options)
           return {
             url: "", method: "auto",
-            instructions: `Sign in in the Chrome window that opens. The first sign-in uses the Google account Chrome is already signed in to. To add another account, sign in again: Google's "add another account" page opens, and the account you sign in there is the one this row serves. If the account has no Application Default Credentials yet, approving it also makes gcloud write them in a directory of its own, so the models and the Console credits use the same account. Adding an account that is already signed in saves nothing. The window closes automatically after completion or ten minutes.`,
+            instructions: `A Chrome window opens on Google's consent page and you approve it there; when the plugin already has an account, it opens Google's add-account page first so you can pick which account this is. The plugin closes the window itself when gcloud finishes, so leave it open. An addition counts only when the account approved in the window and the account the new ADC belongs to are the same, and neither was here before; anything else is an overwrite and is removed again. The project is the first of the account's projects that already has the Vertex AI API enabled, chosen automatically; with no such project the sign-in fails instead, so create one and enable the API before trying again. The sign-in expires after ten minutes.`,
             async callback() {
               try {
                 const identity = await login.result
-                // A sign-in that could not resolve a project never named an
-                // account either: saving it would add an account with nothing
-                // behind it, so it fails with the reason instead.
+                // Consent may already have saved ADC and identified its owner.
+                // A project is still required for a usable host record; surface
+                // the recovery instructions without saving an incomplete row.
                 if (!identity.project) return { type: "failed", error: identity.warning ?? "The sign-in did not finish; nothing was saved" }
                 // This run's settings are the row's until it is restarted, so
                 // the hooks that were closed over before the sign-in still
@@ -148,9 +161,10 @@ export const GoogleVertexAuthPlugin = async (input = {}) => {
         const baseURL = endpoint(identity.project, options.location)
         const getToken = tokenProvider(identity)
         // The host has no test button of its own, so the first request after a
-        // sign-in is where an unusable endpoint is named. The probe is free,
-        // runs once per project, and turns a bad project or a disabled API into
-        // a clear error instead of a failed model call.
+        // sign-in is where an unusable endpoint is named. Reading the location
+        // resource is free, runs once per project, and turns a bad project or a
+        // disabled API into a clear error instead of a failed model call. No
+        // model is asked anything: that is the person's test to make.
         await endorse(identity, options.location, auth?.accountId ?? auth?.project ?? identity.project)
         const allowed = new URL(baseURL)
         const routes = ["/chat/completions", "/completions", "/embeddings", "/models"]

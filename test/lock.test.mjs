@@ -1,0 +1,63 @@
+import assert from "node:assert/strict"
+import test from "node:test"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { apart, take } from "../lib/lock.mjs"
+
+// Two accounts on one Chrome profile are read one after the other, and magpie
+// may run each account's read in a process of its own — so the lock that keeps
+// them apart has to be a file, and a hold has to be something another process
+// waits on rather than fails on.
+
+test("a lock held by another process is waited for, then taken", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vertex-lock-"))
+  try {
+    const file = join(directory, "balance")
+    const release = await take(file)
+    // A second taker does not fail: it waits, and gets the lock once released.
+    let taken = false
+    const waiter = take(file, { poll: 20 }).then((done) => { taken = true; return done })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    assert.equal(taken, false)
+    await release()
+    const second = await waiter
+    assert.equal(taken, true)
+    await second()
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test("releasing twice frees the lock once, and the gap counts from the release", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vertex-lock-"))
+  try {
+    const file = join(directory, "balance")
+    const release = await take(file)
+    await release()
+    // A second release must not remove a lock someone else now holds.
+    const held = await take(file)
+    await release()
+    await assert.rejects(take(file, { timeout: 50, poll: 10 }), /still using|retry shortly/)
+    await held()
+    // The recorded release time is what the next reader waits out.
+    const before = Date.now()
+    await apart(file, 300)
+    assert.ok(Date.now() - before >= 250)
+    await apart(file, 0)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test("a lock left by a process that has ended is not waited on", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vertex-lock-"))
+  try {
+    const file = join(directory, "balance")
+    // A pid that cannot be running, as a crash or a reboot leaves behind.
+    await writeFile(`${file}.lock`, String(2 ** 22 + 7))
+    const release = await take(file, { timeout: 500, poll: 20 })
+    await release()
+    // A lock that is still empty is one just being created, not an abandoned
+    // one, and it is waited on rather than swept away.
+    await writeFile(`${file}.lock`, "")
+    await assert.rejects(take(file, { timeout: 300, poll: 20 }), /retry shortly/)
+    assert.equal(await readFile(`${file}.lock`, "utf8"), "")
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})

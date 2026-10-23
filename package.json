@@ -5,8 +5,16 @@
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
-  "files": ["index.mjs", "lib/", "assets/", "README.md", "LICENSE"],
-  "engines": { "node": ">=22" },
+  "files": [
+    "index.mjs",
+    "lib/",
+    "assets/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "check": "node --check index.mjs && node --check lib/browser.mjs && node --check lib/credentials.mjs && node --check lib/credits.mjs && node --check lib/endpoint.mjs && node --check lib/models.mjs && node --check lib/fetch_credits.mjs",
     "models": "node lib/fetch_credits.mjs models",
@@ -15,9 +23,23 @@
     "login": "node lib/fetch_credits.mjs login",
     "credentials": "node lib/fetch_credits.mjs credentials"
   },
-  "dependencies": { "playwright-core": "^1.56.0" },
-  "keywords": ["opencode", "opencode-plugin", "magpie", "gcp-ai", "gcp", "vertex", "credits", "usage", "quota"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "gcp-ai",
+    "gcp",
+    "vertex",
+    "credits",
+    "usage",
+    "quota"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/Yaka88/google_vertex_plugin.git" },
-  "magpie": { "icon": "https://raw.githubusercontent.com/Yaka88/google_vertex_plugin/main/assets/icon.png" }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yaka88/google_vertex_plugin.git"
+  },
+  "magpie": {
+    "icon": "./assets/icon.png"
+  }
 }

@@ -6,7 +6,8 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { EventEmitter } from "node:events"
-import { accountOf, adcDirectoryFor, adcFile, adcSlug, authorizeAdc, effectiveAuthMode, resolveAccount, resolveAdcDirectory, resolveIdentity, resolveProject, runGcloud, startLogin, tokenProvider } from "../lib/credentials.mjs"
+import { accountOf, adcDirectoryFor, adcFile, adcSlug, authorizeAdc, effectiveAuthMode, hasAdc, resolveAccount, resolveAdcDirectory, resolveIdentity, resolveProject, runGcloud, startLogin, tokenProvider } from "../lib/credentials.mjs"
+import { expandPath } from "../lib/browser.mjs"
 import { fakeGcloud } from "./gcloud.mjs"
 import { parseCreditTables, usageOf } from "../lib/credits.mjs"
 import { availableModels, toProviderModels } from "../lib/models.mjs"
@@ -144,9 +145,14 @@ test("ADC names its sign-in from the token, so the row shows the account and not
   assert.equal(await accountOf("t", async () => ({ ok: true, json: async () => ({ email: "--not-an-email" }) })), undefined)
 })
 
-test("ADC setup opens gcloud's own consent URL in the existing Chrome, so one sign-in makes both ADC and cookies", async () => {
+test("ADC setup opens gcloud's own consent URL in a window nothing drives, so one sign-in makes both ADC and cookies", async () => {
   const opened = []
-  const page = { goto: async (url) => { opened.push(url) } }
+  // The consent page is a tab in the sign-in window that is already open — the
+  // same browser, nothing attached to it. A browser Google can detect as driven
+  // would refuse the sign-in, so no second Chrome is started for it.
+  const window = {
+    openTab: async (url) => { opened.push(url); return true },
+  }
   // gcloud writes its URL across several stderr chunks, as the real one does.
   const sibling = (pieces, code) => {
     const child = new EventEmitter()
@@ -157,8 +163,14 @@ test("ADC setup opens gcloud's own consent URL in the existing Chrome, so one si
     return child
   }
   const missing = () => {
-    const child = sibling([], 0)
-    setTimeout(() => child.emit("error", Object.assign(new Error("no gcloud"), { code: "ENOENT" })), 5)
+    const child = new EventEmitter()
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    child.kill = () => {}
+    setTimeout(() => {
+      child.stderr.emit("data", "https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=x&state=y\n")
+      child.emit("error", Object.assign(new Error("no gcloud"), { code: "ENOENT" }))
+    }, 5)
     return child
   }
   const calls = []
@@ -172,7 +184,7 @@ test("ADC setup opens gcloud's own consent URL in the existing Chrome, so one si
   const fixture = await fakeGcloud()
   try {
     await fixture.clearAdc()
-    await authorizeAdc(page, { project: "example-project" }, run)
+    await authorizeAdc({ project: "example-project" }, run, window)
     await new Promise((done) => setTimeout(done, 50))
     // One URL opened, from gcloud's own flow; BROWSER is neutralised so the
     // plugin's Chrome, and not a second window gcloud starts, shows it.
@@ -192,7 +204,7 @@ test("ADC setup opens gcloud's own consent URL in the existing Chrome, so one si
       return child
     }
     const slow = (pieces) => split([...pieces, "\n"], 0)
-    await authorizeAdc(page, {}, () => slow(["https://accounts.google.com/o/oauth2/auth?response_type=code", "&client_id=x&state=y"]))
+    await authorizeAdc({}, () => slow(["https://accounts.google.com/o/oauth2/auth?response_type=code", "&client_id=x&state=y"]), window)
     assert.equal(opened.length, 1)
     // The newline gcloud ends the URL with is not part of the address.
     assert.match(opened[0].trimEnd(), /client_id=x&state=y$/)
@@ -200,21 +212,22 @@ test("ADC setup opens gcloud's own consent URL in the existing Chrome, so one si
     // worked, so the exit code is not the answer.
     await fixture.clearAdc()
     const writesThenFails = () => {
-      const child = split([], 1)
+      const child = split(["https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=x&state=y\n"], 1)
       setTimeout(() => { void fixture.setAdc({ quota_project_id: "adc-project" }) }, 5)
       return child
     }
-    await authorizeAdc(page, {}, writesThenFails)
+    await authorizeAdc({}, writesThenFails, window)
     // Nothing written: that is a real failure.
     await fixture.clearAdc()
-    await assert.rejects(authorizeAdc(page, {}, () => split([], 1)), /gcloud could not set up ADC/)
-    await assert.rejects(authorizeAdc(page, {}, missing), /gcloud CLI was not found/)
+    await assert.rejects(authorizeAdc({}, () => split(["https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=x&state=y\n"], 1), window), /gcloud could not set up ADC/)
+    await assert.rejects(authorizeAdc({}, missing, window), /gcloud CLI was not found/)
   } finally { await fixture.close() }
 })
 
 test("ADC uses only its own token command, never assumes the active gcloud account, and adds ADC only when there is none", async () => {
   const fixture = await fakeGcloud()
   try {
+    await fixture.setAdc({})
     const identity = await resolveIdentity({ authMode: "adc" })
     assert.deepEqual(identity, { project: "example-project", source: "gcloud", authMode: "adc" })
     assert.equal(await tokenProvider(identity)(), "fixture-token")
@@ -228,13 +241,12 @@ test("ADC uses only its own token command, never assumes the active gcloud accou
     // as it stands and never created by the plugin.
     await fixture.setAdc({ quota_project_id: "adc-project" })
     await fixture.set({ token: "fixture-token" })
-    const login = await startLogin({ project: "example-project", account: "user@example.com", authMode: "gcloud" }, async () => ({
-      page: { goto: async () => {}, isClosed: () => false, waitForFunction: async () => { throw new Error("no Console in this test") } },
-      close: async () => {},
-    }))
+    const login = await startLogin({ project: "example-project", account: "user@example.com", authMode: "gcloud" }, signInWindowOf([]))
     const result = await login.result
-    assert.equal(result.creditsSession, "unavailable")
-    assert.match(result.warning, /no Console/)
+    // An explicit gcloud sign-in is the user's own: the window opened and was
+    // read for the gcloud identity, and no ADC login was run for them.
+    assert.equal(result.project, "example-project")
+    assert.equal(result.creditsSession, "ready")
     assert.ok(!(await fixture.calls()).some((args) => args.includes("login")))
     await assert.rejects(tokenProvider({ authMode: "unknown" })(), /must be auto, gcloud or adc/)
   } finally { await fixture.close() }
@@ -246,10 +258,10 @@ test("auto mode prefers ADC like official Vertex clients, takes its quota projec
     // No ADC file: the gcloud user login remains the identity.
     assert.equal(await effectiveAuthMode(), "gcloud")
     assert.deepEqual(await resolveIdentity(), { project: "example-project", account: "user@example.com", source: "gcloud", authMode: "gcloud" })
-    // ADC exists: it wins, and its recorded quota project beats gcloud's project.
+    // ADC exists: it wins, and its project resolves from gcloud config (ADC's quota project is for billing quota, not Vertex project selection).
     await fixture.setAdc({ quota_project_id: "adc-project" })
     assert.equal(await effectiveAuthMode(), "adc")
-    assert.deepEqual(await resolveIdentity(), { project: "adc-project", source: "gcloud", authMode: "adc" })
+    assert.deepEqual(await resolveIdentity(), { project: "example-project", source: "gcloud", authMode: "adc" })
     assert.equal(await tokenProvider({})() , "fixture-token")
     assert.ok((await fixture.calls()).some((args) => args.slice(0, 3).join(" ") === "auth application-default print-access-token"))
     // An explicit mode still overrides detection in both directions.
@@ -265,85 +277,110 @@ test("auto mode prefers ADC like official Vertex clients, takes its quota projec
   } finally { await fixture.close() }
 })
 
-test("Chrome login reuses terminal credentials, closes its window afterwards, and keeps inference when Console fails", async () => {
+test("a sign-in with a pre-existing ADC file counts as an overwrite and fails", async () => {
   const fixture = await fakeGcloud()
   try {
     await fixture.setAdc({ quota_project_id: "adc-project" })
-    for (const denied of [false, true]) {
-      let closed = 0
-      let visited
-      // The first Console visit reports permission; later ones are the real
-      // check. Google Account names the signed-in profile.
-      const answers = denied ? ["Permission denied", "Permission denied"] : ["Google Cloud Console", "Google Cloud Console"]
-      const browser = {
-        page: {
-          goto: async (url) => { visited = new URL(url) },
-          isClosed: () => false,
-          waitForFunction: async (fn) => {
-            // The Console page is asked two things: whether it is signed in
-            // (projectInConsole) and who it belongs to (accountInPage). Both
-            // answer from the one page this test loads.
-            const source = String(fn)
-            if (source.includes("gserviceaccount")) return { jsonValue: async () => "signed-in@example.com", dispose: async () => {} }
-            if (source.includes("last_project_id")) return { jsonValue: async () => "adc-project", dispose: async () => {} }
-            return { jsonValue: async () => ({ text: answers.shift() ?? "Google Cloud Console" }), dispose: async () => {} }
-          },
-        },
-        close: async () => { closed++ },
-      }
-      // A sign-in that already used the default ADC keeps using it: that is
-      // the single-account machine this profile has always served.
-      const login = await startLogin({ cloudsdkConfig: process.env.CLOUDSDK_CONFIG }, async (options) => {
-        assert.equal(options.headless, false)
-        return browser
-      })
-      const result = await login.result
-      assert.equal(result.project, "adc-project")
-      // The sign-in's window is closed once it is done: the profile keeps its
-      // cookies on disk, and no Chrome is left running behind the user.
-      await login.close()
-      assert.equal(closed, 1)
-      assert.equal(result.creditsSession, denied ? "unavailable" : "ready")
-      if (denied) assert.match(result.warning, /permission denied/i)
-      // The page that named the project and account is the one that stays:
-      // nothing navigates again just to re-ask what it already answered.
-      if (!denied) {
-        assert.equal(visited.searchParams.get("project"), null)
-        assert.equal(result.account, "signed-in@example.com")
+    const visited = []
+    const openWindow = async ({ url }) => {
+      visited.push(new URL(url))
+      return {
+        ended: new Promise((resolve) => setTimeout(resolve, 5)),
+        openTab: async () => true,
+        close: async () => {},
       }
     }
-    assert.ok(!(await fixture.calls()).some((args) => args.includes("login")))
+    const login = await startLogin({ cloudsdkConfig: process.env.CLOUDSDK_CONFIG, account: "user@example.com" }, openWindow)
+    const result = await login.result
+    assert.equal(result.creditsSession, "unavailable")
+    assert.match(result.warning, /already signed in|ADC already existed/i)
+    assert.ok(await hasAdc())
   } finally { await fixture.close() }
 })
 
 test("a second Google account gets its own ADC directory, and an unknown one never borrows the first account's", async () => {
   const fixture = await fakeGcloud()
+  const root = join(fixture.directory, "plugin")
+  // adcOwner asks Google who a directory's token belongs to; the fixture's
+  // token is the email the directory was set up for.
+  const original = globalThis.fetch
+  globalThis.fetch = mockFetch()
   try {
-    // No ADC anywhere: the first sign-in takes gcloud's default directory.
-    assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com" }), { directory: adcDirectoryFor("first@example.com"), exists: false })
-    // An ADC whose token answers for this account is its own, whichever
-    // directory holds it, so a working single-account machine is left alone.
-    await fixture.set({ token: "fixture-token" })
-    const userinfo = async () => ({ ok: true, json: async () => ({ email: "first@example.com" }) })
-    const original = globalThis.fetch
-    globalThis.fetch = userinfo
-    try {
-      await fixture.setAdc()
-      assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com" }), { directory: undefined, exists: true })
-      // A different account must not inherit that ADC: it gets a directory of
-      // its own and is made to sign in there.
-      assert.deepEqual(await resolveAdcDirectory({ account: "second@example.com" }), { directory: adcDirectoryFor("second@example.com"), exists: false })
-    } finally { globalThis.fetch = original }
-    // An account that named a directory is read only from there, even while
-    // GOOGLE_APPLICATION_CREDENTIALS points somewhere else.
-    const own = join(fixture.directory, "own-sdk")
+    // No ADC anywhere: every sign-in writes under the plugin's own root, one
+    // directory per account, and never into gcloud's machine-wide one.
+    assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com", adcRoot: root }), { directory: adcDirectoryFor("first@example.com", root), exists: false })
+    assert.deepEqual(await resolveAdcDirectory({ account: "second@example.com", adcRoot: root }), { directory: adcDirectoryFor("second@example.com", root), exists: false })
+    // An ADC the plugin signed in is read from where the plugin keeps it.
+    const own = adcDirectoryFor("first@example.com", root)
     await mkdir(own, { recursive: true })
     await writeFile(join(own, "application_default_credentials.json"), JSON.stringify({ type: "authorized_user", client_id: "id", client_secret: "secret", refresh_token: "refresh" }))
+    assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com", adcRoot: root }), { directory: own, exists: true })
+    // A different account must not inherit it: it gets a directory of its own
+    // and is made to sign in there.
+    assert.deepEqual(await resolveAdcDirectory({ account: "second@example.com", adcRoot: root }), { directory: adcDirectoryFor("second@example.com", root), exists: false })
+    // An ADC the machine already has is used as it stands when its token
+    // answers for the account...
+    await rm(own, { recursive: true, force: true })
+    await fixture.set({ token: "first@example.com" })
+    await fixture.setAdc()
+    assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com", cloudsdkConfig: process.env.CLOUDSDK_CONFIG, adcRoot: root }), { directory: expandPath(process.env.CLOUDSDK_CONFIG), exists: true })
+    // ...and never by another account, which is sent to its own directory.
+    assert.deepEqual(await resolveAdcDirectory({ account: "other@example.com", adcRoot: root }), { directory: adcDirectoryFor("other@example.com", root), exists: false })
+    // gcloud's default directory is the machine's. Another account's sign-in
+    // there is not borrowed, and new credentials never go into it: they are
+    // written under the plugin's own root.
+    const defaultDirectory = join(fixture.directory, ".config", "gcloud")
+    const home = process.env.HOME
+    process.env.HOME = fixture.directory
+    process.env.XDG_CONFIG_HOME = join(fixture.directory, ".config")
+    process.env.CLOUDSDK_CONFIG = defaultDirectory
+    await mkdir(defaultDirectory, { recursive: true })
+    await writeFile(join(defaultDirectory, "application_default_credentials.json"), JSON.stringify({ type: "authorized_user", client_id: "id", client_secret: "secret", refresh_token: "refresh" }))
+    try {
+      const resolved = await resolveAdcDirectory({ account: "third@example.com", cloudsdkConfig: defaultDirectory })
+      assert.equal(resolved.exists, false)
+      assert.match(resolved.directory, /gcp-ai\/adc-third-example-com$/)
+      assert.ok(!resolved.directory.startsWith(defaultDirectory))
+      // An account the machine's own ADC does answer for is left as it is.
+      await fixture.set({ token: "first@example.com" })
+      assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com", cloudsdkConfig: defaultDirectory }), { directory: defaultDirectory, exists: true })
+    } finally {
+      delete process.env.XDG_CONFIG_HOME
+      if (home === undefined) delete process.env.HOME
+      else process.env.HOME = home
+    }
+    // An account that named a directory is read only from there, even while
+    // GOOGLE_APPLICATION_CREDENTIALS points somewhere else.
+    const named = join(fixture.directory, "own-sdk")
+    await mkdir(named, { recursive: true })
+    await writeFile(join(named, "application_default_credentials.json"), JSON.stringify({ type: "authorized_user", client_id: "id", client_secret: "secret", refresh_token: "refresh" }))
     process.env.GOOGLE_APPLICATION_CREDENTIALS = join(fixture.directory, "elsewhere.json")
-    assert.equal(await adcFile({ cloudsdkConfig: own }), join(own, "application_default_credentials.json"))
-    assert.deepEqual(await resolveAdcDirectory({ cloudsdkConfig: "~/own-sdk" }), { directory: join(homedir(), "own-sdk"), exists: false })
-  } finally { await fixture.close() }
+    assert.equal(await adcFile({ cloudsdkConfig: named }), join(named, "application_default_credentials.json"))
+    // A row that names a directory of its own keeps it, even before an account
+    // is known; nothing is written there until a sign-in names the account.
+    assert.deepEqual(await resolveAdcDirectory({ cloudsdkConfig: "~/own-sdk", adcRoot: root }), { directory: join(homedir(), "own-sdk"), exists: true })
+  } finally {
+    globalThis.fetch = original
+    await fixture.close()
+  }
 })
+
+// The one window a sign-in opens. Nothing is attached to it, so what it offers
+// is the address it was opened on, the tabs handed to it afterwards (gcloud's
+// consent page), and the moment it ends — which, for a person who has just
+// signed in, is immediately.
+function signInWindowOf(visited, tabs = []) {
+  const opened = new Promise((resolve) => setTimeout(resolve, 5))
+  return async ({ url }) => {
+    visited.push(new URL(url))
+    return {
+      ended: opened,
+      openTab: async (tabUrl) => { tabs.push(tabUrl); return true },
+      close: async () => {},
+    }
+  }
+}
+
 
 // A page for a Chrome profile that holds several Google accounts. Google's
 // add-account page brings the browser back to the Console as the account that
@@ -377,83 +414,185 @@ function profileOf(accounts, project = "adc-project", added = accounts.at(-1)) {
   return { page, visited, close: async () => {} }
 }
 
-// The token each gcloud config directory prints stands for that ADC's account,
-// so asking Google who a token belongs to answers from the file's directory.
-const tokenIsEmail = () => async (url, init) => ({
-  ok: true, json: async () => ({ email: String(init.headers.authorization).replace(/^Bearer /, "") }),
-})
+// Routes fetch requests by URL host for testing sign-in and project listing.
+const mockFetch = (projects = [{ projectId: "example-project", name: "Example Project", lifecycleState: "ACTIVE" }]) => async (url, init) => {
+  const parsed = new URL(url)
+  if (parsed.host === "openidconnect.googleapis.com") {
+    return {
+      ok: true,
+      json: async () => ({ email: String(init.headers.authorization).replace(/^Bearer /, "") }),
+    }
+  }
+  if (parsed.host === "cloudresourcemanager.googleapis.com") {
+    return {
+      ok: true,
+      json: async () => ({ projects }),
+    }
+  }
+  if (parsed.host === "serviceusage.googleapis.com") {
+    const match = parsed.pathname.match(/\/v1\/projects\/([^/]+)\/services\/aiplatform\.googleapis\.com/)
+    const projectId = match ? decodeURIComponent(match[1]) : undefined
+    const candidate = projects.find((p) => p.projectId === projectId)
+    const enabled = candidate ? candidate.vertexEnabled !== false : false
+    return {
+      ok: true,
+      json: async () => ({ state: enabled ? "ENABLED" : "DISABLED" }),
+    }
+  }
+  return { ok: false, status: 404 }
+}
 
 test("a second sign-in opens Google's add-account page directly and takes the account it returns", async () => {
   const fixture = await fakeGcloud()
   try {
     const first = "first@example.com"
     const second = "second@example.com"
-    const own = adcDirectoryFor(second, fixture.directory)
-    await fixture.set({ token: first, tokens: { [own]: second } })
+    const root = join(fixture.directory, "plugin")
+    const own = adcDirectoryFor(second, root)
+    // The consent page is approved as the second account: that is the token the
+    // staging directory prints, and the only place the account is learned from.
+    await fixture.set({ token: first, pendingToken: second })
     const original = globalThis.fetch
-    globalThis.fetch = tokenIsEmail()
+    globalThis.fetch = mockFetch()
     try {
-      // The first account already has its ADC in the default directory, so it
-      // is the one this machine signed in with: this sign-in adds another.
-      await fixture.setAdc()
-      const profile = profileOf([first, second])
-      const login = await startLogin({ adcRoot: fixture.directory, profile: join(fixture.directory, "profile") }, async () => profile)
+      // An account this plugin already filed is what makes a sign-in an
+      // addition; the machine's own ADC is not this plugin's account list, so
+      // it would not put the add-account page in front of the sign-in.
+      const known = adcDirectoryFor(first, root)
+      await mkdir(known, { recursive: true })
+      await writeFile(join(known, "application_default_credentials.json"), JSON.stringify({ type: "authorized_user", client_id: "id", client_secret: "secret", refresh_token: "refresh" }))
+      const visited = []
+      const tabs = []
+      const login = await startLogin({ adcRoot: root, profile: join(fixture.directory, "profile") }, signInWindowOf(visited, tabs, second))
       const result = await login.result
       assert.equal(result.account, second)
       // The very first page is Google's add-account page; there is no address
       // to type and no account to pick from a list beforehand.
-      assert.equal(profile.visited[0].host, "accounts.google.com")
-      assert.equal(profile.visited[0].pathname, "/AddSession")
-      assert.equal(profile.visited.filter((url) => url.host === "console.cloud.google.com").length, 1)
-      // The second account's ADC went to its own directory.
+      assert.equal(visited[0].host, "accounts.google.com")
+      assert.equal(visited[0].pathname, "/AddSession")
+      // One window: the account is learned from the token the consent page
+      // produced, so nothing else is opened to ask who it is.
+      assert.equal(visited.length, 1)
+      // (The consent tab itself is covered where gcloud's URL is read: the
+      // fixture's gcloud writes ADC without printing one.)
+      assert.deepEqual(tabs, [])
+      // The second account's ADC went to its own directory, and no staging
+      // directory was left behind.
       assert.equal(await adcFile({ cloudsdkConfig: own }), join(own, "application_default_credentials.json"))
+      assert.deepEqual((await readdir(root)).filter((name) => name.includes("pending")), [])
     } finally { globalThis.fetch = original }
   } finally { await fixture.close() }
 })
 
-test("adding an account that is already signed in saves nothing", async () => {
+test("a sign-in whose ADC names an account not signed in here is a new account", async () => {
+  const fixture = await fakeGcloud()
+  try {
+    const email = "unwritten@example.com"
+    const root = join(fixture.directory, "plugin")
+    await fixture.clearAdc()
+    await fixture.set({ token: email, pendingToken: email })
+    const original = globalThis.fetch
+    globalThis.fetch = mockFetch()
+    try {
+      const login = await startLogin({ adcRoot: root, profile: join(fixture.directory, "profile") }, signInWindowOf([], []))
+      const result = await login.result
+      assert.equal(result.account, email)
+      assert.equal(result.creditsSession, "ready")
+    } finally { globalThis.fetch = original }
+  } finally { await fixture.close() }
+})
+
+test("adding an account whose ADC lives in machine config succeeds", async () => {
   const fixture = await fakeGcloud()
   try {
     const first = "first@example.com"
-    await fixture.set({ token: first })
+    const root = join(fixture.directory, "plugin")
+    await fixture.set({ token: first, pendingToken: first })
     const original = globalThis.fetch
-    globalThis.fetch = tokenIsEmail()
+    globalThis.fetch = mockFetch()
     try {
       await fixture.setAdc()
-      // The add-account page comes back as the account this machine already
-      // signed in with: nothing is added, and no ADC is written for it.
-      const profile = profileOf([first, "second@example.com"], "adc-project", first)
-      const login = await startLogin({ adcRoot: fixture.directory, profile: join(fixture.directory, "profile") }, async () => profile)
+      // Machine ADC does not make an account already signed in, so it can be added.
+      const login = await startLogin({ adcRoot: root, profile: join(fixture.directory, "profile") }, signInWindowOf([]))
       const result = await login.result
-      assert.equal(result.creditsSession, "unavailable")
-      assert.match(result.warning, /first@example\.com is already signed in, so no account was added/)
-      assert.ok(!(await fixture.calls()).some((args) => args.includes("login")))
+      assert.equal(result.account, first)
+      assert.equal(result.creditsSession, "ready")
     } finally { globalThis.fetch = original }
   } finally { await fixture.close() }
 })
 
-test("approving the consent page as another account saves nothing and keeps no ADC for the wanted one", async () => {
+test("an account whose project list has no Vertex-enabled project fails the sign-in, registers nothing, and leaves no ADC directory behind", async () => {
   const fixture = await fakeGcloud()
   try {
-    const first = "first@example.com"
+    const email = "noproject@example.com"
+    const root = join(fixture.directory, "plugin")
+    await fixture.clearAdc()
+    await fixture.set({ token: email, pendingToken: email })
+    const original = globalThis.fetch
+    globalThis.fetch = mockFetch([])
+    try {
+      const login = await startLogin({ adcRoot: root, profile: join(fixture.directory, "profile") }, signInWindowOf([], []))
+      const result = await login.result
+      assert.equal(result.creditsSession, "unavailable")
+      assert.match(result.warning, /has Vertex AI enabled|Create a Google Cloud project and enable the Vertex AI API/i)
+      assert.deepEqual(await readdir(root).catch(() => []), [])
+    } finally { globalThis.fetch = original }
+  } finally { await fixture.close() }
+})
+
+test("a consent page approved as another account saves nothing and keeps no ADC for the wanted one", async () => {
+  const fixture = await fakeGcloud()
+  try {
     const wanted = "wanted@example.com"
-    const own = adcDirectoryFor(wanted, fixture.directory)
-    // The consent page is approved as the account already signed in, not the
-    // one this sign-in is for.
-    await fixture.set({ token: first, approved: first, tokens: { [own]: first } })
+    const other = "other@example.com"
+    const root = join(fixture.directory, "plugin")
+    const own = adcDirectoryFor(wanted, root)
+    // This machine's own gcloud sign-in is the account the row named; the
+    // consent page is approved as someone else, and the token written for that
+    // row says so.
+    await fixture.set({ token: wanted, pendingToken: other })
     const original = globalThis.fetch
-    globalThis.fetch = tokenIsEmail()
+    globalThis.fetch = mockFetch()
     try {
-      await fixture.setAdc()
-      const profile = profileOf([first, wanted])
-      const login = await startLogin({ adcRoot: fixture.directory, profile: join(fixture.directory, "profile") }, async () => profile)
+      const login = await startLogin({ adcRoot: root, account: wanted, profile: join(fixture.directory, "profile") }, signInWindowOf([]))
       const result = await login.result
       assert.equal(result.creditsSession, "unavailable")
-      assert.match(result.warning, /first@example\.com is already signed in, and the consent page approved that account rather than wanted@example\.com/)
-      // Nothing was filed under the wanted account: no ADC, and no directory
-      // left behind that a later sign-in would read as one already signed in.
+      assert.match(result.warning, /consent page approved other@example\.com, not wanted@example\.com/)
+      // Nothing was filed under the wanted account, and no directory is left
+      // that a later sign-in would read as one already signed in.
       await assert.rejects(readFile(join(own, "application_default_credentials.json")))
-      assert.deepEqual(await readdir(fixture.directory).then((names) => names.filter((name) => name.startsWith("gcp-adc-"))), [])
+      for (const name of await readdir(root).catch(() => [])) {
+        await assert.rejects(readFile(join(root, name, "application_default_credentials.json")), `${name} still holds an ADC`)
+      }
+    } finally { globalThis.fetch = original }
+  } finally { await fixture.close() }
+})
+
+// A gcloud config directory holds far more than ADC: the named configurations
+// and the credential database behind every `gcloud auth login` on the machine.
+// A sign-in that has to undo what it wrote must undo exactly one file.
+test("a sign-in that saves nothing leaves the user's gcloud config directory untouched", async () => {
+  const fixture = await fakeGcloud()
+  const sdk = join(fixture.directory, "users-gcloud")
+  try {
+    await mkdir(join(sdk, "configurations"), { recursive: true })
+    await writeFile(join(sdk, "configurations", "config_default"), "[core]\nproject = kept-project\n")
+    await writeFile(join(sdk, "credentials.db"), "kept-credential-database")
+    delete process.env.CLOUDSDK_CONFIG
+    // The consent page approves someone other than the account the row named.
+    await fixture.set({ token: "other@example.com", pendingToken: "other@example.com" })
+    const original = globalThis.fetch
+    globalThis.fetch = mockFetch()
+    try {
+      const login = await startLogin({ adcRoot: join(fixture.directory, "plugin"), cloudsdkConfig: sdk, account: "me@example.com", profile: join(fixture.directory, "profile") }, signInWindowOf([]))
+      const result = await login.result
+      assert.equal(result.creditsSession, "unavailable")
+      assert.match(result.warning, /consent page approved other@example\.com, not me@example\.com/)
+      // Nothing of the user's was removed.
+      assert.equal(await readFile(join(sdk, "credentials.db"), "utf8"), "kept-credential-database")
+      assert.equal(await readFile(join(sdk, "configurations", "config_default"), "utf8"), "[core]\nproject = kept-project\n")
+      // And the ADC file this run wrote is gone, with the directory it made.
+      await assert.rejects(readFile(join(fixture.directory, "plugin", "adc-me-example-com", "application_default_credentials.json")))
     } finally { globalThis.fetch = original }
   } finally { await fixture.close() }
 })
@@ -461,32 +600,33 @@ test("approving the consent page as another account saves nothing and keeps no A
 test("a sign-in refuses to file one account's ADC and cookies under another", async () => {
   const fixture = await fakeGcloud()
   try {
-    await fixture.setAdc()
-    let closed = 0
-    const browser = {
-      page: {
-        goto: async () => {},
-        isClosed: () => false,
-        waitForFunction: async (fn) => {
-          const source = String(fn)
-          if (source.includes("gserviceaccount")) return { jsonValue: async () => "someone-else@example.com", dispose: async () => {} }
-          if (source.includes("last_project_id")) return { jsonValue: async () => "adc-project", dispose: async () => {} }
-          return { jsonValue: async () => ({ text: "Google Cloud Console" }), dispose: async () => {} }
-        },
-      },
-      close: async () => { closed++ },
-    }
-    // Chrome holds someone else, and the named account never arrives. The
-    // window would stay on Google's add-account page for a person to sign in;
-    // a test has nobody to wait for, so its patience is milliseconds.
-    const login = await startLogin({ account: "intended@example.com", loginTimeout: 1500 }, async () => browser)
-    const result = await login.result
-    // Chrome is signed in as another account: the sign-in fails instead of
-    // recording intended@example.com over the wrong cookies and ADC.
-    assert.equal(result.creditsSession, "unavailable")
-    assert.match(result.warning, /signed in as someone-else@example\.com, not intended@example\.com/)
-    await login.close()
-    assert.equal(closed, 1)
+    // No ADC yet, so this run would write one; the consent page approves
+    // someone else, and the token is the only thing that can say so. That
+    // account is not one this machine already signed in with, so the refusal
+    // is about the mismatch and not about adding a duplicate.
+    await fixture.clearAdc()
+    await fixture.set({ token: "someone-else@example.com", pendingToken: "someone-else@example.com", approved: "someone-else@example.com" })
+    const original = globalThis.fetch
+    globalThis.fetch = mockFetch()
+    try {
+      let closed = 0
+      const openWindow = async () => ({
+        ended: new Promise((resolve) => setTimeout(resolve, 5)),
+        openTab: async () => true,
+        close: async () => { closed++ },
+      })
+      const root = join(fixture.directory, "plugin")
+      const login = await startLogin({ account: "intended@example.com", adcRoot: root, profile: join(fixture.directory, "profile") }, openWindow)
+      const result = await login.result
+      // The consent page approved another account: the sign-in fails instead of
+      // recording intended@example.com over the wrong cookies and ADC.
+      assert.equal(result.creditsSession, "unavailable")
+      assert.match(result.warning, /consent page approved someone-else@example\.com, not intended@example\.com/)
+      // Nothing was filed under the account that was wanted.
+      assert.deepEqual(await readdir(root).catch(() => []), [])
+      await login.close()
+      assert.equal(closed, 1)
+    } finally { globalThis.fetch = original }
   } finally { await fixture.close() }
 })
 
@@ -500,28 +640,76 @@ test("plugin is its own gcp-ai row, not Magpie's built-in Vertex provider", asyn
   assert.equal(typeof hooks.auth.loader, "function")
   assert.equal(hooks.auth.methods[0].type, "oauth")
   assert.match(hooks.auth.icon, /^data:image\/png;base64,/)
+  // No switches: there is nothing for a user to turn on before the row works.
+  assert.equal(hooks.auth.options, undefined)
   const config = {}
   await hooks.config(config)
   assert.equal(config.provider["gcp-ai"].name, "GCP AI")
   assert.equal(config.provider["gcp-ai"].npm, "@ai-sdk/openai-compatible")
+  // A row Magpie configured with no models stays empty until someone presses
+  // Fetch models, so the config hook hands over Google's current catalog. The
+  // provider hook replaces it with what the signed-in project can call.
+  const seeded = config.provider["gcp-ai"].models
+  assert.equal(seeded["gemini-4-argon"].name, "Gemini 4 Argon")
+  assert.deepEqual(seeded["gemini-4-argon"].variants, { low: { reasoning_effort: "low" }, medium: { reasoning_effort: "medium" }, high: { reasoning_effort: "high" } })
+  assert.equal(seeded["gemini-2.5-pro"].reasoning, false)
+  // Retired models are in no list: the catalog still names them and calling one
+  // answers 404, so a seed carrying them would offer models that cannot load.
+  for (const gone of ["gemini-1.5-pro-002", "gemini-2.5-flash-preview-04-17", "gemini-2.5-pro-exp-03-25"]) assert.equal(seeded[gone], undefined)
+  // Twelve chat models, and no speech, image, transcription or embedding model.
+  assert.equal(Object.keys(seeded).length, 12)
+  assert.equal(Object.keys(seeded).filter((id) => /tts|embedding|transcribe|image|live|translate|nano-banana|omni/.test(id)).length, 0)
+  // The provider hook is handed the whole provider info, not its models. A
+  // failure must give back provider.models: handing back the object made
+  // magpie read its keys as model ids and offer "id", "name" and "source" as
+  // models on the row.
+  const previousCache = process.env.XDG_CACHE_HOME
+  process.env.XDG_CACHE_HOME = join(await mkdtemp(join(tmpdir(), "vertex-fallback-")), "cache")
+  try {
+    const info = { id: "gcp-ai", name: "GCP AI", source: "config", models: { "gemini-2.5-flash": { id: "gemini-2.5-flash" } } }
+    const fallback = await hooks.provider.models(info, { auth: { authMode: "adc", project: "invalid" } })
+    assert.deepEqual(fallback, info.models)
+    assert.equal(fallback.id, undefined)
+    assert.equal(fallback.source, undefined)
+  } finally {
+    if (previousCache === undefined) delete process.env.XDG_CACHE_HOME
+    else process.env.XDG_CACHE_HOME = previousCache
+  }
   const fixture = await fakeGcloud()
   try {
+    // No switch stands between the row and its balance: asking for usage reads
+    // the Console, which here reaches the billing-account check.
     const usage = await hooks.auth.usage(async () => ({ type: "oauth" }), { options: { billingAccount: "invalid" } })
     assert.equal(usage.signIn, "kept")
     assert.match(usage.error, /billing account ID/)
+    // Nothing magpie hands the plugin turns the read off: a plugin options JSON
+    // and a row option both leave it reading.
+    const fromOptions = await plugin({}, { credits: false })
+    const still = await fromOptions.auth.usage(async () => ({ type: "oauth" }), { options: { billingAccount: "invalid" } })
+    assert.match(still.error, /billing account ID/)
+    const fromRow = await plugin({ magpie: { option: () => false } })
+    const reads = await fromRow.auth.usage(async () => ({ type: "oauth" }), { options: { billingAccount: "invalid" } })
+    assert.match(reads.error, /billing account ID/)
   } finally { await fixture.close() }
 })
 
-test("models are what Google's catalog lists and the project answers for, not a seeded list", async () => {
+test("models are Google's catalog per project and location, newest first, dressed with the catalog's numbers", async () => {
   const directory = await mkdtemp(join(tmpdir(), "vertex-models-test-"))
   const previousCache = process.env.XDG_CACHE_HOME
   process.env.XDG_CACHE_HOME = directory
   try {
     // A cached discovery is returned as it was read, without asking Google.
-    const file = join(directory, "magpie", "gcp-ai", "models-" + createHash("sha256").update(JSON.stringify(["", "", ""])).digest("hex").slice(0, 16) + ".json")
+    // The location is part of the cache's identity, because the same project
+    // serves a different list in each one.
+    const key = (location) => "models-" + createHash("sha256").update(JSON.stringify(["", "", "", location])).digest("hex").slice(0, 16) + ".json"
+    const file = join(directory, "magpie", "gcp-ai", key("global"))
     await mkdir(dirname(file), { recursive: true })
     await writeFile(file, JSON.stringify({ project: "example-project", ids: ["gemini-4-argon", "gemini-3.8-flash"], fetchedAt: new Date().toISOString() }))
-    assert.deepEqual((await availableModels({})).ids, ["gemini-4-argon", "gemini-3.8-flash"])
+    assert.deepEqual((await availableModels({ location: "global" })).ids, ["gemini-4-argon", "gemini-3.8-flash"])
+    // A region's list is not the global one: it is asked for separately.
+    await writeFile(join(directory, "magpie", "gcp-ai", key("us-central1")), JSON.stringify({ project: "example-project", ids: ["gemini-regional"], fetchedAt: new Date().toISOString() }))
+    assert.deepEqual((await availableModels({ location: "us-central1" })).ids, ["gemini-regional"])
+    await assert.rejects(availableModels({ location: "not a region" }), /GOOGLE_VERTEX_LOCATION/)
     // Speech, transcription, translation, embeddings, live and image models
     // are not chat models, however Google lists them.
     const models = toProviderModels(["gemini-4-argon", "gemini-3.8-flash"], { "gemini-4-argon": { name: "Gemini 4 Argon", limit: { context: 1048576, output: 65536 }, cost: { input: 2, output: 10, cache_read: 0.1 }, reasoning_options: [{ type: "effort", values: ["low", "high"] }] } }, "gcp-ai")
@@ -539,6 +727,80 @@ test("models are what Google's catalog lists and the project answers for, not a 
   } finally {
     if (previousCache === undefined) delete process.env.XDG_CACHE_HOME
     else process.env.XDG_CACHE_HOME = previousCache
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("a retired model Google still lists is left out, and only a 404 counts as gone", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vertex-probe-test-"))
+  const previousCache = process.env.XDG_CACHE_HOME
+  process.env.XDG_CACHE_HOME = directory
+  const original = globalThis.fetch
+  const fixture = await fakeGcloud()
+  try {
+    await fixture.setAdc()
+    // The catalog names four models. probed answers for each: a live model
+    // takes the token count, a retired one is NOT_FOUND, one this account may
+    // not call is FORBIDDEN, and one drops the connection.
+    const catalog = ["gemini-4-argon", "gemini-1.5-pro-002", "gemini-3.5-flash", "gemini-2.5-pro"]
+    const answer = { "gemini-4-argon": 200, "gemini-1.5-pro-002": 404, "gemini-3.5-flash": 403, "gemini-2.5-pro": -1 }
+    const asked = []
+    globalThis.fetch = async (url) => {
+      const parsed = new URL(url)
+      if (parsed.host !== "aiplatform.googleapis.com") return { ok: false, status: 404, json: async () => ({}) }
+      if (parsed.pathname.endsWith("/publishers/google/models")) {
+        return { ok: true, json: async () => ({ publisherModels: catalog.map((id) => ({ name: `publishers/google/models/${id}` })) }) }
+      }
+      const id = parsed.pathname.match(/models\/([^:]+):countTokens$/)?.[1]
+      asked.push(id)
+      const status = answer[id]
+      if (status === -1) throw Object.assign(new Error("fetch failed"), { name: "TimeoutError" })
+      return { ok: status === 200, status, json: async () => ({ totalTokens: 1 }) }
+    }
+    const listed = await availableModels({ project: "example-project", location: "global", authMode: "adc", force: true })
+    // A model answering NOT_FOUND is not deployed and is dropped. FORBIDDEN, a
+    // dropped connection and a timeout are not answers about the model, so
+    // those stay: losing a working model to a bad minute is worse than listing
+    // one that may refuse.
+    assert.deepEqual(listed.ids, ["gemini-4-argon", "gemini-3.5-flash", "gemini-2.5-pro"])
+    assert.deepEqual(asked.sort(), [...catalog].sort())
+    // Nothing was generated: the probe reads the request, it does not bill one.
+    assert.equal(asked.length, catalog.length)
+  } finally {
+    globalThis.fetch = original
+    if (previousCache === undefined) delete process.env.XDG_CACHE_HOME
+    else process.env.XDG_CACHE_HOME = previousCache
+    await fixture.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("every model answering 404 is a broken read, not an empty provider", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vertex-probe-all-test-"))
+  const previousCache = process.env.XDG_CACHE_HOME
+  process.env.XDG_CACHE_HOME = directory
+  const original = globalThis.fetch
+  const fixture = await fakeGcloud()
+  try {
+    await fixture.setAdc()
+    // A wrong project or location answers NOT_FOUND for the whole catalog. That
+    // is the read being wrong, not the project having no models, so Google's
+    // names are kept rather than the row being emptied.
+    globalThis.fetch = async (url) => {
+      const parsed = new URL(url)
+      if (parsed.host !== "aiplatform.googleapis.com") return { ok: false, status: 404, json: async () => ({}) }
+      if (parsed.pathname.endsWith("/publishers/google/models")) {
+        return { ok: true, json: async () => ({ publisherModels: [{ name: "publishers/google/models/gemini-4-argon" }, { name: "publishers/google/models/gemini-2.5-pro" }] }) }
+      }
+      return { ok: false, status: 404, json: async () => ({}) }
+    }
+    const listed = await availableModels({ project: "example-project", location: "global", authMode: "adc", force: true })
+    assert.deepEqual(listed.ids, ["gemini-4-argon", "gemini-2.5-pro"])
+  } finally {
+    globalThis.fetch = original
+    if (previousCache === undefined) delete process.env.XDG_CACHE_HOME
+    else process.env.XDG_CACHE_HOME = previousCache
+    await fixture.close()
     await rm(directory, { recursive: true, force: true })
   }
 })
