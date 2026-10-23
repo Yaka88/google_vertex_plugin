@@ -15,14 +15,17 @@ const ID = "gcp-ai"
 // its own account and calls these hooks once per account, handing that
 // account's record in. So what an account recorded beats what the row says —
 // otherwise the second account would read the first one's project, Chrome
-// profile and ADC. An environment variable still beats both: it is the
-// explicit override for a machine that has one account.
+// profile and ADC. So what an account recorded beats what the row says, and
+// both beat the environment: one machine can hold several Google accounts, and
+// a machine-wide variable would point all of them at one account's project.
+// An environment variable is the last resort, for a machine with no account
+// record yet (a first sign-in).
 function settings(provider = {}, auth = {}) {
   auth ??= {}
   const options = provider.options ?? {}
   const env = process.env
   return {
-    project: env.GOOGLE_VERTEX_PROJECT || env.GOOGLE_CLOUD_PROJECT || auth.project || options.project,
+    project: auth.project || options.project || env.GOOGLE_VERTEX_PROJECT || env.GOOGLE_CLOUD_PROJECT,
     location: env.GOOGLE_VERTEX_LOCATION || auth.location || options.location || "global",
     billingAccount: env.VERTEX_BILLING_ACCOUNT || auth.billingAccount || options.billingAccount,
     profile: env.VERTEX_CHROME_PROFILE || auth.profile || options.profile || defaultProfile(),
