@@ -58,7 +58,8 @@ else process.exit(2)
 `, { mode: 0o700 })
   process.env.PATH = `${directory}:${process.env.PATH}`
   process.env.VERTEX_TEST_GCLOUD = state
-  for (const name of names.slice(3)) delete process.env[name]
+  // From VERTEX_TEST_GCLOUD on: the plugin's own variables, never the fixture's state path.
+  for (const name of names.slice(4)) delete process.env[name]
   process.env.HOME = directory
   delete process.env.USERPROFILE
   // Keep ADC discovery inside the fixture: the developer's own ADC file must

@@ -342,7 +342,7 @@ test("a second Google account gets its own ADC directory, and an unknown one nev
     try {
       const resolved = await resolveAdcDirectory({ account: "third@example.com", cloudsdkConfig: defaultDirectory, adcRoot: root })
       assert.equal(resolved.exists, false)
-      assert.match(resolved.directory, /gcp-ai\/adc-third-example-com$/)
+      assert.equal(resolved.directory, adcDirectoryFor("third@example.com", root))
       assert.ok(!resolved.directory.startsWith(defaultDirectory))
       // An account the machine's own ADC does answer for is left as it is.
       await fixture.set({ token: "first@example.com" })
@@ -636,7 +636,10 @@ test("a sign-in refuses to file one account's ADC and cookies under another", as
   } finally { await fixture.close() }
 })
 
-test("plugin is its own gcp-ai row, not Magpie's built-in Vertex provider", async () => {
+// The fallback below asks Google with an invalid project, so it waits out a
+// connection the way a real one would: the timeout is stated, as the browser
+// tests state theirs.
+test("plugin is its own gcp-ai row, not Magpie's built-in Vertex provider", { timeout: 30000 }, async () => {
   const hooks = await plugin()
   // The built-in google-vertex row keeps its own project, location and ADC
   // path; nothing here renames itself onto it.
