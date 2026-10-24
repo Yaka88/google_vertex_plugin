@@ -1,7 +1,7 @@
 # GCP AI — Google Cloud credits and Vertex models (Magpie / OpenCode plugin)
 
 - **Models**: the Vertex chat models your project can call, newest first.
-- **Inference**: requests are signed with your local gcloud / ADC credentials and billed to your own project.
+- **Inference**: requests speak Gemini's own protocol (`@ai-sdk/google`) to the project's Vertex endpoint, signed with your local gcloud / ADC credentials and billed to your own project.
 - **Credits**: the quota panel can show your Google Cloud promotional credit balance and its expiry date.
 
 You sign in once with your own Google account. No service accounts, no JSON keys, no extra packages: the plugin uses the Chrome you already have.
@@ -9,9 +9,13 @@ You sign in once with your own Google account. No service accounts, no JSON keys
 ## Requirements
 
 - Google Chrome or Chromium (set `VERTEX_CHROME_PATH` if it is somewhere unusual)
-- Google Cloud CLI (`gcloud`), already working
+- Google Cloud CLI (`gcloud`), already working — on Windows the `gcloud.cmd` the installer puts on `PATH` is used
 - A Google Cloud project with Vertex AI enabled
 - To read credits: permission to view the project's billing account (usually `billing.viewer`)
+
+Linux, macOS and Windows are supported. On Windows the plugin's own files live under
+`%APPDATA%` and `%LOCALAPPDATA%` instead of `~/.config` and `~/.cache`, and gcloud is
+started through `cmd.exe`, which is the only way Windows runs a `.cmd`.
 
 ## Install and sign in
 
@@ -39,9 +43,12 @@ Google has no API for promotional credits, so the balance is read from the Cloud
 ## What it keeps where
 
 - **Credentials**: never held by the plugin. gcloud writes them and prints tokens on demand.
-- **ADC directories**: `~/.config/gcp-ai/adc-<account>`, one per Google account. The plugin never writes `~/.config/gcloud`.
-- **Chrome profile**: `~/.config/gcp-auto-profile`.
-- **Cache**: `~/.cache/magpie/gcp-ai`.
+- **ADC directories**: `<config>/gcp-ai/adc-<account>`, one per Google account. The plugin never writes gcloud's own directory.
+- **Chrome profile**: `<config>/gcp-auto-profile`.
+- **Cache**: `<cache>/magpie/gcp-ai`.
+
+`<config>` is `$XDG_CONFIG_HOME`, else `%APPDATA%` on Windows, else `~/.config`. `<cache>` is
+`$XDG_CACHE_HOME`, else `%LOCALAPPDATA%` on Windows, else `~/.cache`.
 
 ## FAQ
 
@@ -71,7 +78,8 @@ Google has no API for promotional credits, so the balance is read from the Cloud
 | `VERTEX_CREDITS_FAILURE_TTL` | `1200` seconds |
 | `VERTEX_CREDITS_TRANSIENT_TTL` | `60` seconds, for network failures |
 | `VERTEX_MODELS_CACHE_TTL` | `21600` seconds (6 hours) |
-| `CLOUDSDK_CONFIG` | `~/.config/gcloud` |
+
+A machine-wide `CLOUDSDK_CONFIG` is never read. It would point every account at one ADC, and a sign-in there would overwrite credentials the plugin didn't write; the plugin only uses its own `<config>/gcp-ai/adc-<account>` directories.
 
 ## Privacy
 

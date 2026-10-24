@@ -31,7 +31,10 @@ function settings(provider = {}, auth = {}) {
     profile: env.VERTEX_CHROME_PROFILE || auth.profile || options.profile || defaultProfile(),
     account: env.VERTEX_GCLOUD_ACCOUNT || auth.accountId || options.account,
     authMode: env.VERTEX_GCLOUD_AUTH_MODE || auth.authMode || options.authMode,
-    cloudsdkConfig: auth.cloudsdkConfig || options.cloudsdkConfig || env.CLOUDSDK_CONFIG,
+    // Only the directory this plugin filed for an account, never a machine-wide
+    // CLOUDSDK_CONFIG: one variable would point every account at one ADC, and a
+    // sign-in there would overwrite credentials the plugin didn't write.
+    cloudsdkConfig: auth.cloudsdkConfig || options.cloudsdkConfig,
   }
 }
 
@@ -42,11 +45,23 @@ const icon = await readFile(new URL("./assets/icon.png", import.meta.url))
   .then((png) => `data:image/png;base64,${png.toString("base64")}`)
   .catch(() => undefined)
 
+// Where Vertex AI serves Gemini itself: the model is in the path and the body
+// is Gemini's own request, which is what the native protocol speaks. Magpie
+// appends "/models/<id>:streamGenerateContent?alt=sse" to this base, and
+// OpenCode's @ai-sdk/google does the same, so the base ends at the publisher.
 function endpoint(project, location) {
   validateProject(project)
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(location)) throw new Error("Invalid GOOGLE_VERTEX_LOCATION")
   const host = location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`
-  return `https://${host}/v1beta1/projects/${project}/locations/${location}/endpoints/openapi`
+  return `https://${host}/v1beta1/projects/${project}/locations/${location}/publishers/google`
+}
+
+// The routes Gemini's own API serves under a publisher, and nothing else: a
+// model call, its count, and the catalog. The token goes no further than these.
+const GEMINI_ROUTE = /^\/models(?:\/[^/]+(?::(?:generateContent|streamGenerateContent|countTokens))?)?$/
+
+function geminiRoute(pathname, base) {
+  return GEMINI_ROUTE.test(pathname.slice(base.length))
 }
 
 // ADC records a project and a quota project, not who signed in, so a sign-in
@@ -91,7 +106,11 @@ export const GoogleVertexAuthPlugin = async (input = {}) => {
       config.provider ??= {}
       const provider = config.provider[ID] ??= {}
       provider.name ??= "GCP AI"
-      provider.npm ??= "@ai-sdk/openai-compatible"
+      // Gemini's own protocol, not the OpenAI-compatible shim: a tool call's
+      // thought signature is part of the conversation there, so a second turn
+      // with a tool result is accepted as it is, and the reply streams with
+      // Vertex's own usage and caching numbers.
+      provider.npm ??= "@ai-sdk/google"
       provider.models = { ...seedModels(), ...(provider.models ?? {}) }
       configured = provider
     },
@@ -155,8 +174,8 @@ export const GoogleVertexAuthPlugin = async (input = {}) => {
           }
         },
       }],
-      // The gcloud user's token signs requests to this project's endpoint only,
-      // and only on the OpenAI-compatible routes it serves.
+      // The gcloud user's token signs requests to this project's publisher
+      // endpoint only, and only on the Gemini routes it serves.
       async loader(getAuth, provider = configured) {
         const auth = await getAuth()
         const options = settings(provider, auth)
@@ -170,14 +189,13 @@ export const GoogleVertexAuthPlugin = async (input = {}) => {
         // model is asked anything: that is the person's test to make.
         await endorse(identity, options.location, auth?.accountId ?? auth?.project ?? identity.project)
         const allowed = new URL(baseURL)
-        const routes = ["/chat/completions", "/completions", "/embeddings", "/models"]
         return {
           baseURL, apiKey: "vertex-managed",
           async fetch(input, init) {
             const request = new Request(input, init)
             const url = new URL(request.url)
             if (url.origin !== allowed.origin || !url.pathname.startsWith(allowed.pathname + "/")) throw new Error("Refusing to send a Vertex credential outside the configured Google model endpoint")
-            if (!routes.some((route) => url.pathname === `${allowed.pathname}${route}`)) throw new Error("Refusing to send a Vertex credential to a route the OpenAI-compatible endpoint does not serve")
+            if (!geminiRoute(url.pathname, allowed.pathname)) throw new Error("Refusing to send a Vertex credential to a route the Gemini endpoint does not serve")
             const headers = new Headers(request.headers)
             headers.delete("x-goog-api-key")
             headers.delete("x-api-key")

@@ -3,7 +3,7 @@ import test from "node:test"
 import plugin from "../index.mjs"
 import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
-import { homedir, tmpdir } from "node:os"
+import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { EventEmitter } from "node:events"
 import { accountOf, adcDirectoryFor, adcFile, adcSlug, authorizeAdc, effectiveAuthMode, hasAdc, resolveAccount, resolveAdcDirectory, resolveIdentity, resolveProject, runGcloud, startLogin, tokenProvider } from "../lib/credentials.mjs"
@@ -126,7 +126,7 @@ test("CLI verifies gcloud without exposing tokens and rejects all removed key fl
   try {
     console.log = (value) => { output = JSON.parse(value) }
     await main(["credentials", "--account", "selected@example.com"])
-    assert.deepEqual(output, { project: "example-project", account: "selected@example.com", source: "gcloud", authMode: "gcloud", cloudsdkConfig: process.env.CLOUDSDK_CONFIG, inferenceAuth: "token-verified" })
+    assert.deepEqual(output, { project: "example-project", account: "selected@example.com", source: "gcloud", authMode: "gcloud", inferenceAuth: "token-verified" })
     assert.ok(!JSON.stringify(output).includes("fixture-token"))
   } finally { console.log = originalLog; await fixture.close() }
 })
@@ -277,10 +277,16 @@ test("auto mode prefers ADC like official Vertex clients, takes its quota projec
   } finally { await fixture.close() }
 })
 
-test("a sign-in with a pre-existing ADC file counts as an overwrite and fails", async () => {
+test("a sign-in with an ADC the plugin already filed counts as an overwrite and fails", async () => {
   const fixture = await fakeGcloud()
+  const root = join(fixture.directory, "plugin")
   try {
-    await fixture.setAdc({ quota_project_id: "adc-project" })
+    // The plugin's own ADC for this account is the overwrite. gcloud's
+    // machine-wide one is not: it belongs to gcloud, is only ever read, and a
+    // sign-in writes this plugin's credential beside it.
+    const own = adcDirectoryFor("user@example.com", root)
+    await mkdir(own, { recursive: true })
+    await writeFile(join(own, "application_default_credentials.json"), JSON.stringify({ type: "authorized_user", client_id: "id", client_secret: "secret", refresh_token: "refresh" }))
     const visited = []
     const openWindow = async ({ url }) => {
       visited.push(new URL(url))
@@ -290,11 +296,13 @@ test("a sign-in with a pre-existing ADC file counts as an overwrite and fails", 
         close: async () => {},
       }
     }
-    const login = await startLogin({ cloudsdkConfig: process.env.CLOUDSDK_CONFIG, account: "user@example.com" }, openWindow)
+    const login = await startLogin({ adcRoot: root, account: "user@example.com" }, openWindow)
     const result = await login.result
     assert.equal(result.creditsSession, "unavailable")
     assert.match(result.warning, /already signed in|ADC already existed/i)
-    assert.ok(await hasAdc())
+    // Refused before anything opened: no window, and the ADC is as it was.
+    assert.deepEqual(visited, [])
+    assert.equal(await readFile(join(own, "application_default_credentials.json"), "utf8").then((text) => JSON.parse(text).refresh_token), "refresh")
   } finally { await fixture.close() }
 })
 
@@ -323,31 +331,30 @@ test("a second Google account gets its own ADC directory, and an unknown one nev
     await rm(own, { recursive: true, force: true })
     await fixture.set({ token: "first@example.com" })
     await fixture.setAdc()
-    assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com", cloudsdkConfig: process.env.CLOUDSDK_CONFIG, adcRoot: root }), { directory: expandPath(process.env.CLOUDSDK_CONFIG), exists: true })
+    assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com", cloudsdkConfig: fixture.sdk, adcRoot: root }), { directory: expandPath(fixture.sdk), exists: true })
     // ...and never by another account, which is sent to its own directory.
     assert.deepEqual(await resolveAdcDirectory({ account: "other@example.com", adcRoot: root }), { directory: adcDirectoryFor("other@example.com", root), exists: false })
     // gcloud's default directory is the machine's. Another account's sign-in
     // there is not borrowed, and new credentials never go into it: they are
     // written under the plugin's own root.
-    const defaultDirectory = join(fixture.directory, ".config", "gcloud")
-    const home = process.env.HOME
-    process.env.HOME = fixture.directory
+    const defaultDirectory = fixture.sdk
     process.env.XDG_CONFIG_HOME = join(fixture.directory, ".config")
-    process.env.CLOUDSDK_CONFIG = defaultDirectory
-    await mkdir(defaultDirectory, { recursive: true })
-    await writeFile(join(defaultDirectory, "application_default_credentials.json"), JSON.stringify({ type: "authorized_user", client_id: "id", client_secret: "secret", refresh_token: "refresh" }))
     try {
-      const resolved = await resolveAdcDirectory({ account: "third@example.com", cloudsdkConfig: defaultDirectory })
+      const resolved = await resolveAdcDirectory({ account: "third@example.com", cloudsdkConfig: defaultDirectory, adcRoot: root })
       assert.equal(resolved.exists, false)
       assert.match(resolved.directory, /gcp-ai\/adc-third-example-com$/)
       assert.ok(!resolved.directory.startsWith(defaultDirectory))
       // An account the machine's own ADC does answer for is left as it is.
       await fixture.set({ token: "first@example.com" })
-      assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com", cloudsdkConfig: defaultDirectory }), { directory: defaultDirectory, exists: true })
+      assert.deepEqual(await resolveAdcDirectory({ account: "first@example.com", cloudsdkConfig: defaultDirectory, adcRoot: root }), { directory: defaultDirectory, exists: true })
+      // The machine-wide variable is not consulted at all: with no directory
+      // named, the ADC read is gcloud's default, whatever the variable says.
+      process.env.CLOUDSDK_CONFIG = join(fixture.directory, "someone-elses-sdk")
+      assert.equal(await adcFile(), join(defaultDirectory, "application_default_credentials.json"))
+      assert.deepEqual(await resolveAdcDirectory({ account: "third@example.com", adcRoot: root }), { directory: adcDirectoryFor("third@example.com", root), exists: false })
+      delete process.env.CLOUDSDK_CONFIG
     } finally {
       delete process.env.XDG_CONFIG_HOME
-      if (home === undefined) delete process.env.HOME
-      else process.env.HOME = home
     }
     // An account that named a directory is read only from there, even while
     // GOOGLE_APPLICATION_CREDENTIALS points somewhere else.
@@ -358,7 +365,7 @@ test("a second Google account gets its own ADC directory, and an unknown one nev
     assert.equal(await adcFile({ cloudsdkConfig: named }), join(named, "application_default_credentials.json"))
     // A row that names a directory of its own keeps it, even before an account
     // is known; nothing is written there until a sign-in names the account.
-    assert.deepEqual(await resolveAdcDirectory({ cloudsdkConfig: "~/own-sdk", adcRoot: root }), { directory: join(homedir(), "own-sdk"), exists: true })
+    assert.deepEqual(await resolveAdcDirectory({ cloudsdkConfig: "~/own-sdk", adcRoot: root }), { directory: join(process.env.HOME, "own-sdk"), exists: true })
   } finally {
     globalThis.fetch = original
     await fixture.close()
@@ -578,7 +585,6 @@ test("a sign-in that saves nothing leaves the user's gcloud config directory unt
     await mkdir(join(sdk, "configurations"), { recursive: true })
     await writeFile(join(sdk, "configurations", "config_default"), "[core]\nproject = kept-project\n")
     await writeFile(join(sdk, "credentials.db"), "kept-credential-database")
-    delete process.env.CLOUDSDK_CONFIG
     // The consent page approves someone other than the account the row named.
     await fixture.set({ token: "other@example.com", pendingToken: "other@example.com" })
     const original = globalThis.fetch
@@ -645,7 +651,7 @@ test("plugin is its own gcp-ai row, not Magpie's built-in Vertex provider", asyn
   const config = {}
   await hooks.config(config)
   assert.equal(config.provider["gcp-ai"].name, "GCP AI")
-  assert.equal(config.provider["gcp-ai"].npm, "@ai-sdk/openai-compatible")
+  assert.equal(config.provider["gcp-ai"].npm, "@ai-sdk/google")
   // A row Magpie configured with no models stays empty until someone presses
   // Fetch models, so the config hook hands over Google's current catalog. The
   // provider hook replaces it with what the signed-in project can call.
@@ -718,12 +724,13 @@ test("models are Google's catalog per project and location, newest first, dresse
     // goes after the ones it does.
     const dated = { "gemini-2.5-pro": { release_date: "2025-06-17" }, "gemini-4-argon": { release_date: "2026-10-13" } }
     assert.deepEqual(Object.keys(toProviderModels(["gemini-2.5-pro", "undated", "gemini-4-argon"], dated, "gcp-ai")), ["gemini-4-argon", "gemini-2.5-pro", "undated"])
-    assert.equal(models["gemini-4-argon"].api.id, "google/gemini-4-argon")
+    assert.equal(models["gemini-4-argon"].api.id, "gemini-4-argon")
+    assert.equal(models["gemini-4-argon"].api.npm, "@ai-sdk/google")
     assert.equal(models["gemini-4-argon"].limit.context, 1048576)
     assert.deepEqual(Object.keys(models["gemini-4-argon"].variants), ["low", "high"])
     // A model the catalog doesn't know is still listed, from Google's id alone.
     assert.equal(models["gemini-3.8-flash"].name, "gemini-3.8-flash")
-    assert.equal(models["gemini-3.8-flash"].api.id, "google/gemini-3.8-flash")
+    assert.equal(models["gemini-3.8-flash"].api.id, "gemini-3.8-flash")
   } finally {
     if (previousCache === undefined) delete process.env.XDG_CACHE_HOME
     else process.env.XDG_CACHE_HOME = previousCache
