@@ -13,8 +13,10 @@ You sign in once with your own Google account. No service accounts, no JSON keys
 - A Google Cloud project with Vertex AI enabled
 - To read credits: permission to view the project's billing account (usually `billing.viewer`)
 
-Linux, macOS and Windows are supported. On Windows the plugin's own files live under
-`%APPDATA%` and `%LOCALAPPDATA%` instead of `~/.config` and `~/.cache`, and gcloud is
+Linux has been tried with real accounts. Support for macOS and Windows is
+implemented, but has not been tried with a real account on either platform.
+On Windows the plugin's own files live under `%APPDATA%` and `%LOCALAPPDATA%`
+instead of `~/.config` and `~/.cache`, and gcloud is
 started through `cmd.exe`, which is the only way Windows runs a `.cmd`.
 
 ## What this was run on

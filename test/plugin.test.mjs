@@ -167,10 +167,7 @@ test("ADC setup opens gcloud's own consent URL in a window nothing drives, so on
     child.stdout = new EventEmitter()
     child.stderr = new EventEmitter()
     child.kill = () => {}
-    setTimeout(() => {
-      child.stderr.emit("data", "https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=x&state=y\n")
-      child.emit("error", Object.assign(new Error("no gcloud"), { code: "ENOENT" }))
-    }, 5)
+    setTimeout(() => child.emit("error", Object.assign(new Error("no gcloud"), { code: "ENOENT" })), 5)
     return child
   }
   const calls = []
@@ -448,6 +445,107 @@ const mockFetch = (projects = [{ projectId: "example-project", name: "Example Pr
   }
   return { ok: false, status: 404 }
 }
+
+test("a named sign-in saves its own ADC and refuses a later duplicate", async () => {
+  const fixture = await fakeGcloud()
+  const original = globalThis.fetch
+  globalThis.fetch = mockFetch()
+  try {
+    const account = "me@example.com"
+    const root = join(fixture.directory, "plugin")
+    const own = adcDirectoryFor(account, root)
+    await fixture.set({ approved: account })
+    const visited = []
+    const login = await startLogin({ adcRoot: root, account }, signInWindowOf(visited))
+    assert.deepEqual(await login.result, {
+      project: "example-project", account, source: "gcloud", authMode: "adc", cloudsdkConfig: own, creditsSession: "ready",
+    })
+    assert.equal(visited.length, 1)
+    const file = join(own, "application_default_credentials.json")
+    const saved = await readFile(file, "utf8")
+    assert.equal(JSON.parse(saved).approved, account)
+    assert.deepEqual(await resolveAdcDirectory({ adcRoot: root, account }), { directory: own, exists: true })
+    const duplicate = await startLogin({ adcRoot: root, account }, signInWindowOf(visited))
+    assert.match((await duplicate.result).warning, /already signed in/)
+    assert.equal(visited.length, 1)
+    assert.equal(await readFile(file, "utf8"), saved)
+    assert.deepEqual(await readdir(root), ["adc-me-example-com"])
+  } finally { globalThis.fetch = original; await fixture.close() }
+})
+
+for (const named of [true, false]) {
+  test(`accounts with the same slug keep separate ADCs after ${named ? "named" : "unnamed"} sign-ins`, { timeout: 20000 }, async () => {
+    const fixture = await fakeGcloud()
+    const original = globalThis.fetch
+    globalThis.fetch = mockFetch()
+    try {
+      const root = join(fixture.directory, "plugin")
+      const first = "a.b@x.com"
+      const second = "a-b@x.com"
+      const plain = adcDirectoryFor(first, root)
+      const hashed = `${plain}-${createHash("sha256").update(second).digest("hex").slice(0, 6)}`
+      assert.equal(adcSlug(first), adcSlug(second))
+      const visited = []
+      const signIn = async (account) => {
+        await fixture.set({ approved: account })
+        const login = await startLogin({ adcRoot: root, ...(named ? { account } : {}) }, signInWindowOf(visited))
+        return login.result
+      }
+      const one = await signIn(first)
+      assert.equal(one.account, first)
+      assert.equal(one.cloudsdkConfig, plain)
+      assert.equal(one.creditsSession, "ready")
+      const saved = await readFile(join(plain, "application_default_credentials.json"), "utf8")
+      // A definite mismatch chooses the second account's directory even before
+      // it exists; reading must never borrow the first account's ADC.
+      assert.deepEqual(await resolveAdcDirectory({ adcRoot: root, account: second }), { directory: hashed, exists: false })
+      const two = await signIn(second)
+      assert.equal(two.account, second)
+      assert.equal(two.cloudsdkConfig, hashed)
+      assert.equal(two.project, "example-project")
+      assert.equal(two.creditsSession, "ready")
+      assert.equal(visited.length, 2)
+      for (const [account, directory] of [[first, plain], [second, hashed]]) {
+        assert.deepEqual(await resolveAdcDirectory({ adcRoot: root, account }), { directory, exists: true })
+        assert.equal(await tokenProvider({ authMode: "adc", cloudsdkConfig: directory })(), account)
+        const duplicate = await signIn(account)
+        assert.equal(duplicate.project, undefined)
+        assert.match(duplicate.warning, /already signed in/)
+      }
+      assert.equal(await readFile(join(plain, "application_default_credentials.json"), "utf8"), saved)
+      assert.equal(JSON.parse(await readFile(join(hashed, "application_default_credentials.json"), "utf8")).approved, second)
+      assert.deepEqual((await readdir(root)).sort(), [plain, hashed].map((directory) => directory.slice(root.length + 1)).sort())
+    } finally { globalThis.fetch = original; await fixture.close() }
+  })
+}
+
+test("a sign-in without gcloud finishes promptly, opens no window, and removes its directory", { timeout: 10000 }, async () => {
+  const fixture = await fakeGcloud()
+  const original = globalThis.fetch
+  globalThis.fetch = async () => assert.fail("A missing gcloud must not make a Google request")
+  try {
+    const root = join(fixture.directory, "plugin")
+    const empty = join(fixture.directory, "empty-path")
+    await mkdir(empty)
+    process.env.PATH = empty
+    for (const account of [undefined, "me@example.com"]) {
+      const visited = []
+      const login = await startLogin({ adcRoot: root, account, loginTimeout: 20000 }, signInWindowOf(visited))
+      let timer
+      try {
+        const result = await Promise.race([
+          login.result,
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Missing gcloud left sign-in pending")), 2000) }),
+        ])
+        assert.equal(result.project, undefined)
+        assert.equal(result.creditsSession, "unavailable")
+        assert.match(result.warning, /gcloud CLI was not found/)
+        assert.deepEqual(visited, [])
+        assert.deepEqual(await readdir(root), [])
+      } finally { clearTimeout(timer); await login.close() }
+    }
+  } finally { globalThis.fetch = original; await fixture.close() }
+})
 
 test("a second sign-in opens Google's add-account page directly and takes the account it returns", async () => {
   const fixture = await fakeGcloud()

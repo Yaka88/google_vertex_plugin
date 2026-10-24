@@ -89,7 +89,7 @@ test("Console session waits for passive sign-in, rejects persistent forms, and h
 // The Console names the signed-in account under an obfuscated key. A page that
 // has an address but not that key has no answer: another address on it could be
 // a project member, a billing contact, or a notification.
-test("the signed-in account is only read from the Console's own keyed field", { ...needsBrowser }, async () => {
+test("the signed-in account is only read from the Console's own keyed field", { timeout: 40000, ...needsBrowser }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "vertex-browser-account-"))
   let browser
   try {

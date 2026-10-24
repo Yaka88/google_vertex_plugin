@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { apart, take } from "../lib/lock.mjs"
@@ -44,6 +44,29 @@ test("releasing twice frees the lock once, and the gap counts from the release",
     assert.ok(Date.now() - before >= 250)
     await apart(file, 0)
   } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test("a live pid cannot keep an abandoned lock past fifteen minutes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vertex-lock-"))
+  // With no /proc start time available, a reused pid is indistinguishable
+  // from the holder. The age ceiling must still leave a full sign-in time.
+  const original = process.platform
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true })
+  try {
+    const file = join(directory, "balance")
+    await writeFile(`${file}.lock`, String(process.pid))
+    const recent = new Date(Date.now() - 11 * 60 * 1000)
+    await utimes(`${file}.lock`, recent, recent)
+    await assert.rejects(take(file, { timeout: 50, poll: 10 }), /retry shortly/)
+    const stale = new Date(Date.now() - 16 * 60 * 1000)
+    await utimes(`${file}.lock`, stale, stale)
+    const release = await take(file, { timeout: 500, poll: 20 })
+    assert.equal(await readFile(`${file}.lock`, "utf8"), String(process.pid))
+    await release()
+  } finally {
+    Object.defineProperty(process, "platform", { value: original, configurable: true })
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test("a lock left by a process that has ended is not waited on", async () => {
