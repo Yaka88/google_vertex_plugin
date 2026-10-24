@@ -6,7 +6,7 @@ import { join } from "node:path"
 // the developer's gcloud configuration or making Google requests.
 export async function fakeGcloud() {
   const directory = await mkdtemp(join(tmpdir(), "vertex-gcloud-test-"))
-  const names = ["PATH", "HOME", "USERPROFILE", "VERTEX_TEST_GCLOUD", "GOOGLE_VERTEX_PROJECT", "VERTEX_GCLOUD_ACCOUNT", "VERTEX_BILLING_ACCOUNT", "VERTEX_GCLOUD_AUTH_MODE", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CONFIG", "GOOGLE_APPLICATION_CREDENTIALS", "XDG_CONFIG_HOME"]
+  const names = ["PATH", "HOME", "USERPROFILE", "VERTEX_TEST_GCLOUD", "GOOGLE_VERTEX_PROJECT", "GOOGLE_VERTEX_LOCATION", "VERTEX_CHROME_PROFILE", "VERTEX_GCLOUD_ACCOUNT", "VERTEX_BILLING_ACCOUNT", "VERTEX_GCLOUD_AUTH_MODE", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CONFIG", "GOOGLE_APPLICATION_CREDENTIALS", "XDG_CONFIG_HOME"]
   const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]))
   const state = join(directory, "state.json")
   const log = join(directory, "calls.jsonl")

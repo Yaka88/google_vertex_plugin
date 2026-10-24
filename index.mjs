@@ -26,11 +26,11 @@ function settings(provider = {}, auth = {}) {
   const env = process.env
   return {
     project: auth.project || options.project || env.GOOGLE_VERTEX_PROJECT || env.GOOGLE_CLOUD_PROJECT,
-    location: env.GOOGLE_VERTEX_LOCATION || auth.location || options.location || "global",
-    billingAccount: env.VERTEX_BILLING_ACCOUNT || auth.billingAccount || options.billingAccount,
-    profile: env.VERTEX_CHROME_PROFILE || auth.profile || options.profile || defaultProfile(),
-    account: env.VERTEX_GCLOUD_ACCOUNT || auth.accountId || options.account,
-    authMode: env.VERTEX_GCLOUD_AUTH_MODE || auth.authMode || options.authMode,
+    location: auth.location || options.location || env.GOOGLE_VERTEX_LOCATION || "global",
+    billingAccount: auth.billingAccount || options.billingAccount || env.VERTEX_BILLING_ACCOUNT,
+    profile: auth.profile || options.profile || env.VERTEX_CHROME_PROFILE || defaultProfile(),
+    account: auth.accountId || auth.account || options.account || env.VERTEX_GCLOUD_ACCOUNT,
+    authMode: auth.authMode || options.authMode || env.VERTEX_GCLOUD_AUTH_MODE,
     // Only the directory this plugin filed for an account, never a machine-wide
     // CLOUDSDK_CONFIG: one variable would point every account at one ADC, and a
     // sign-in there would overwrite credentials the plugin didn't write.

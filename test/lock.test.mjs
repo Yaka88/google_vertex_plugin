@@ -84,3 +84,21 @@ test("a lock left by a process that has ended is not waited on", async () => {
     assert.equal(await readFile(`${file}.lock`, "utf8"), "")
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
+
+test("Linux keeps a live holder even when its lock is over fifteen minutes old", { skip: process.platform !== "linux" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vertex-lock-"))
+  const original = Date.now
+  let release
+  try {
+    const file = join(directory, "balance")
+    release = await take(file)
+    // Advance wall time without placing the lock before this process started.
+    Date.now = () => original() + 16 * 60 * 1000
+    await assert.rejects(take(file, { timeout: 50, poll: 10 }), /retry shortly/)
+    assert.equal(await readFile(`${file}.lock`, "utf8"), String(process.pid))
+  } finally {
+    Date.now = original
+    await release?.()
+    await rm(directory, { recursive: true, force: true })
+  }
+})

@@ -1,3 +1,4 @@
+import "./network.mjs"
 import assert from "node:assert/strict"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -10,7 +11,17 @@ import { assertConsoleSession, chromeExecutable, closeKeptBrowsers as endKeptBro
 process.env.VERTEX_CHROME_IDLE = "0"
 import { discoverBillingAccount, fetchCredits, usageOf } from "../lib/credits.mjs"
 
-// These two tests drive the machine's own Chrome, which the plugin starts and
+// Chrome's services run outside routeAll. Deny external name resolution at
+// launch, as one argv value (no shell quotes), for every test browser.
+const launchArgs = [
+  "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+  // Any request not served by routeAll is sent to a closed loopback port.
+  // Chrome may still perform its own numeric IPv6 reachability probe.
+  "--proxy-server=http://127.0.0.1:9",
+  "--proxy-bypass-list=<-loopback>",
+]
+
+// These tests drive the machine's own Chrome, which the plugin starts and
 // speaks to over its pipe transport. A machine with no Chrome can still load
 // the plugin and its hooks; it just cannot open a browser, and says so here
 // rather than failing as a broken test.
@@ -40,7 +51,7 @@ test("Console session waits for passive sign-in, rejects persistent forms, and h
   const directory = await mkdtemp(join(tmpdir(), "vertex-browser-session-"))
   let browser
   try {
-    browser = await openBrowser({ profile: join(directory, "profile") })
+    browser = await openBrowser({ launchArgs, profile: join(directory, "profile") })
     const hosts = new Set()
     await routeAll(browser.page, pageFor((url) => {
       hosts.add(url.hostname)
@@ -93,7 +104,7 @@ test("the signed-in account is only read from the Console's own keyed field", { 
   const directory = await mkdtemp(join(tmpdir(), "vertex-browser-account-"))
   let browser
   try {
-    browser = await openBrowser({ profile: join(directory, "profile"), headless: true })
+    browser = await openBrowser({ launchArgs, profile: join(directory, "profile"), headless: true })
     await routeAll(browser.page, async (request) => request.fulfill({ body: '<!doctype html><p>Contact billing@example.com or owner@example.com</p>' }))
     await browser.page.goto("https://console.cloud.google.com/")
     assert.equal(await extractAccount(browser.page, { timeout: 1000 }), undefined)
@@ -119,8 +130,9 @@ test("a second read on one profile is a tab of the browser the first left open",
     process.env.VERTEX_CHROME_IDLE = "60000"
     const profile = join(directory, "profile")
     const seen = []
-    const read = (label) => withPage({ profile }, async (page) => {
+    const read = (label) => withPage({ profile, launchArgs }, async (page) => {
       seen.push({ label, connection: page.connection, pid: page.connection.child.pid, targetId: page.targetId })
+      await routeAll(page, pageFor(() => "<h1>Google Cloud Console</h1>"))
       await page.goto("https://console.cloud.google.com/")
       return label
     })
@@ -156,7 +168,7 @@ test("Chrome credits scrape handles pagination, keeps cache isolated, and force 
   try {
     process.env.XDG_CACHE_HOME = directory
     const profile = join(directory, "profile")
-    browser = await openBrowser({ profile })
+    browser = await openBrowser({ profile, launchArgs })
     let requests = 0
     await routeAll(browser.page, async (request) => {
       const url = new URL(request.url())
@@ -207,7 +219,7 @@ test("a failed credit read is cached instead of opening a browser each poll", { 
     process.env.XDG_CACHE_HOME = directory
     const profile = join(directory, "profile")
     let requests = 0
-    browser = await openBrowser({ profile })
+    browser = await openBrowser({ profile, launchArgs })
     await routeAll(browser.page, async (request) => {
       requests++
       return request.fulfill({ body: "<!doctype html><h1>No credits table here</h1>" })
