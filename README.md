@@ -17,6 +17,16 @@ Linux, macOS and Windows are supported. On Windows the plugin's own files live u
 `%APPDATA%` and `%LOCALAPPDATA%` instead of `~/.config` and `~/.cache`, and gcloud is
 started through `cmd.exe`, which is the only way Windows runs a `.cmd`.
 
+## What this was run on
+
+Sign-in, model listing and a real inference request were run on **Linux** against
+**two real Google accounts**, with gcloud's own ADC and with an ADC the plugin wrote.
+
+The Windows path — `cmd.exe` for `gcloud.cmd`, `%APPDATA%`/`%LOCALAPPDATA%` for the
+plugin's own files — is implemented and covered by the unit tests' path handling, but
+**has not been run on a Windows machine with a real account**. If it misbehaves there,
+that is why; macOS has likewise not been tried with a real account.
+
 ## Install and sign in
 
 ```bash
@@ -43,7 +53,7 @@ Google has no API for promotional credits, so the balance is read from the Cloud
 ## What it keeps where
 
 - **Credentials**: never held by the plugin. gcloud writes them and prints tokens on demand.
-- **ADC directories**: `<config>/gcp-ai/adc-<account>`, one per Google account. The plugin never writes gcloud's own directory.
+- **ADC directories**: `<config>/gcp-ai/adc-<account>`, one per Google account. The plugin never writes gcloud's own directory. Two addresses that differ only in punctuation would share a directory name, so the second one gets a short hash of its address appended.
 - **Chrome profile**: `<config>/gcp-auto-profile`.
 - **Cache**: `<cache>/magpie/gcp-ai`.
 

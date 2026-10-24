@@ -164,7 +164,10 @@ test("Chrome credits scrape handles pagination, keeps cache isolated, and force 
       assert.match(url.pathname, /^\/billing\//)
       assert.ok(url.searchParams.get("authuser").endsWith("@example.com"))
       requests++
-      return request.fulfill({ body: `<!doctype html><table><thead><tr>
+      // The Console names the account it rendered for under its own obfuscated
+      // key, which is what a credits read is checked against.
+      const shown = url.searchParams.get("authuser")
+      return request.fulfill({ body: `<!doctype html><script>var a={"oPEP7c":${JSON.stringify(shown)}}</script><table><thead><tr>
         <th>Credit name</th><th>Status</th><th>Remaining value</th><th>Original value</th><th>Credit ID</th>
         </tr></thead><tbody><tr><td>Benefit one</td><td>Available</td><td>$10.00</td><td>$10.00</td><td>one</td></tr></tbody></table>
         <button aria-label="Next page" onclick="document.querySelector('tbody').innerHTML='<tr><td>Benefit two</td><td>Available</td><td>$2.07</td><td>$10.00</td><td>two</td></tr>';this.disabled=true">Next</button>` })
