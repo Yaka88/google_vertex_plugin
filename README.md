@@ -38,7 +38,7 @@ plugin's own files — is implemented and covered by the unit tests' path handli
 **has not been run on a Windows machine with a real account**. If it misbehaves there,
 that is why; macOS has likewise not been tried with a real account.
 
-## Download Install and sign in
+## Download and Install
 
 [github.com/Yaka88/google_vertex_plugin](https://github.com/Yaka88/google_vertex_plugin)
 
