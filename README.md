@@ -57,7 +57,7 @@ One Chrome window opens. Approve the consent page there and the plugin closes th
 - The first account goes straight to Google's consent page. Adding a second one starts on Google's account picker instead, in the same window.
 - Add another account by clicking sign in again with a different Google account.
 - The project is picked for you: the first of the account's projects with the Vertex AI API enabled.
-- If the account already has an ADC here, nothing is added and your existing sign-in is left alone.
+- If the account already has an ADC here, nothing is added and your existing sign-in is left alone. "Already here" is decided by Google's stable account ID (`sub`), not by email: after consent the new ADC's `sub` is compared with every ADC the plugin manages, so the same Google account under a changed email is still recognised. If an existing ADC's `sub` cannot be confirmed, the sign-in stops rather than guess.
 
 ## Credits
 
@@ -66,7 +66,7 @@ Google has no API for promotional credits, so the balance is read from the Cloud
 ## What it keeps where
 
 - **Credentials**: never held by the plugin. gcloud writes them and prints tokens on demand.
-- **ADC directories**: `<config>/gcp-ai/adc-<account>`, one per Google account. The plugin never writes gcloud's own directory. Two addresses that differ only in punctuation would share a directory name, so the second one gets a short hash of its address appended.
+- **ADC directories**: `<config>/gcp-ai/adc-<account>`, one per Google account. The plugin never writes gcloud's own directory. Two addresses that differ only in punctuation would share a directory name, so the second one gets a short hash of its address appended (then a hash of its `sub`). Consent is first written to a private `.adc-pending-*` directory and moved into place only after its `sub` is checked; that check and the move share a cross-process lock. A directory's name is storage only, never proof of whose account it is.
 - **Chrome profile**: `<config>/gcp-auto-profile`.
 - **Cache**: `<cache>/magpie/gcp-ai`.
 
@@ -79,11 +79,53 @@ Google has no API for promotional credits, so the balance is read from the Cloud
 
 **"This browser or app may not be secure"?** Start the sign-in again from the row and use the window that opens. Nothing in it is automated.
 
-**"That account was already signed in"?** Signing in adds an account; it does not refresh one. Use a different Google account.
+**"Already signed in (same Google subject)"?** Signing in adds an account; it does not refresh one. The new consent and an existing ADC belong to the same Google account, even if the emails differ; the new credentials are removed and the original kept.
+
+**"An existing ADC's Google subject could not be confirmed"?** One of the ADCs already here could not tell Google's `sub` (its token failed, or userinfo did not answer), so a duplicate cannot be ruled out and nothing is added. Restore that credential, or remove the stale account, and retry.
+
+**Changed your Google account's email?** Nothing needs to be done. The account stays the same account in Magpie, under the address it was signed in with; its credits are read for the new address and the new address is shown beside it.
+
+- Each usage refresh asks Google's userinfo endpoint, with the account's own token, for its current email and `sub`. Google: `sub` is "unique among all Google Accounts and never reused", and "a Google Account can have multiple email addresses at different points in time, but the `sub` value is never changed".
+- The credits page is opened for the current email and the plugin checks the Google ID in Console's own page data against `sub`. A matching ID accepts the new email even while userinfo still returns the old one; a different ID is refused even when the emails match. Without IDs on the page the shown email must match.
+- A refresh whose token answers with a different (or no) `sub` than the one saved is refused: that is another Google account.
+- Saved per account at sign-in: `googleSubject` and `accountId` (with a `#<hash>` suffix when two Google accounts share one email). `accountId` is not changed after a rename: it is the account's key in Magpie, which keeps the account's name, proxy, gateway key and quota history under it, and gcloud keeps the credentials under the original sign-in address (`credentialAccount`, `consoleAccount` and `consoleSubject` on older records are still read if present, while `usage()` never writes back to the host auth record). The current email is cached with the credits and reaches Magpie as `usage().user`, which Magpie shows where it differs from the key.
+- Console's ID fields are private page data, not a documented API; a page that names conflicting IDs is refused.
+
+If Console's ID cannot be read and the shown email differs, you can map the saved address to the current one in the `gcp-ai` provider's `options` (or the plugin's options; the provider's win). Confirm first that both addresses are the same Google account: the map only picks the Console session, and cannot override a `sub` mismatch.
+
+```json
+{ "consoleAccountAliases": { "old@example.com": "new@example.com" } }
+```
 
 **Wrong account on the consent page?** Sign in again and pick the right one. Nothing that was already here is removed.
 
 **Credits don't match the billing page?** Promotional credits belong to the billing account and can be shared across projects, and the Console has billing latency.
+
+**"Cannot tell which billing account project … uses"?** The project's billing page showed no billing account, or more than one. Name it per project, so each of your projects keeps its own:
+
+```json
+{ "billingAccounts": { "my-project": "AAAAAA-BBBBBB-CCCCCC" } }
+```
+
+A project's entry wins over a row's `billingAccount` and `VERTEX_BILLING_ACCOUNT`, which apply to every project.
+
+**A billing account in yen?** The credits are read in US dollars unless the billing account is named as Japanese yen (USD and JPY are the two currencies read; nothing is converted):
+
+```json
+{ "billingCurrencies": { "AAAAAA-BBBBBB-CCCCCC": "JPY" } }
+```
+
+A ¥ is never taken for yen on its own, since the Console writes Chinese yuan with the same sign: a ¥ table read as USD names the setting instead. Yen balances show as, for example, `¥8500 JPY`.
+
+**"The Cloud Console page was translated by Chrome" or "columns are not the English ones"?** The table is read by its English column names. Turn off translation for `console.cloud.google.com` in the plugin's Chrome profile (in the translate icon in the address bar: *Never translate this site*), and retry.
+
+**Several Chrome profiles in the plugin's profile folder?** Chrome opens the profile used last, so whose session a read uses can change when you switch profiles there. Pin the profile directory (its folder name inside the profile, such as `Default` or `Profile 1`), per Google account or for every account:
+
+```json
+{ "profileDirectories": { "me@example.com": "Profile 1" }, "profileDirectory": "Default" }
+```
+
+These go in the `gcp-ai` provider's `options` or the plugin's options (the provider's win). A sign-in window opens in the directory `profileDirectory` names, since the account it signs in is not known yet.
 
 ## Configuration
 
@@ -92,6 +134,7 @@ Google has no API for promotional credits, so the balance is read from the Cloud
 | `GOOGLE_VERTEX_LOCATION` | `global` |
 | `VERTEX_BILLING_ACCOUNT` | Looked up from the project |
 | `VERTEX_CHROME_PROFILE` | `~/.config/gcp-auto-profile` |
+| `VERTEX_CHROME_PROFILE_DIRECTORY` | None: Chrome's last-used profile; `profileDirectories` and `profileDirectory` win |
 | `VERTEX_CHROME_PATH` | Detected |
 | `VERTEX_GCLOUD_ACCOUNT` | The signed-in account |
 | `VERTEX_GCLOUD_AUTH_MODE` | `auto`; also `adc` or `gcloud` |

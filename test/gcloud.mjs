@@ -15,7 +15,11 @@ export async function fakeGcloud() {
   // sides meet at $HOME/.config/gcloud: the fake gcloud writes there, and so
   // does the plugin's own account directories stay out of it.
   const sdk = join(directory, ".config", "gcloud")
-  await writeFile(join(directory, "gcloud"), `#!/usr/bin/env node
+  // The fake runs on this test's own runtime, named by path: another
+  // package's tests in the same run may leave PATH without node (grok's
+  // nocli.mjs keeps only /usr/bin and /bin), and setup-node's node is not
+  // there on CI.
+  await writeFile(join(directory, "gcloud"), `#!${process.execPath}
 import { appendFileSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 const state = JSON.parse(readFileSync(process.env.VERTEX_TEST_GCLOUD, "utf8"))

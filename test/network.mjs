@@ -5,19 +5,29 @@ import net from "node:net"
 import tls from "node:tls"
 import { syncBuiltinESMExports } from "node:module"
 
-// Importable by tests and as --import: never retain the real fetch for a test
-// to restore. Record violations too, since production fallbacks catch errors.
+// Importable by tests and as --import: the real fetch stays in this module,
+// never on globalThis for a test to restore. Record violations too, since
+// production fallbacks catch errors.
 const unexpected = []
 function refuse(kind, target) {
   const message = `Unexpected network ${kind} in test: ${target}`
   unexpected.push(message)
   throw new Error(message)
 }
-globalThis.fetch = (input) => refuse("fetch", input?.url ?? input)
 
 const local = (host) => {
   const value = String(host ?? "localhost").replace(/^\[|\]$/g, "").toLowerCase()
   return value === "localhost" || value === "::1" || /^127(?:\.\d{1,3}){3}$/.test(value)
+}
+// bun test runs every package's files in one process, so this outlives
+// gcp-ai's tests: another package's fetch to its own loopback server goes on.
+const realFetch = globalThis.fetch
+globalThis.fetch = (input, init) => {
+  const target = input?.url ?? input
+  let host
+  try { host = new URL(String(target)).hostname } catch {}
+  if (host === undefined || !local(host)) refuse("fetch", target)
+  return realFetch(input, init)
 }
 function check(kind, host) {
   if (!local(host)) refuse(kind, host)

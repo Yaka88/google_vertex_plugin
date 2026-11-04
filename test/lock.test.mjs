@@ -3,7 +3,7 @@ import test from "node:test"
 import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { apart, take } from "../lib/lock.mjs"
+import { abandoned, apart, take } from "../lib/lock.mjs"
 
 // Two accounts on one Chrome profile are read one after the other, and magpie
 // may run each account's read in a process of its own — so the lock that keeps
@@ -101,4 +101,13 @@ test("Linux keeps a live holder even when its lock is over fifteen minutes old",
     await release?.()
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+// #650: a holder can let go between a waiter's failed open and its look at the
+// lock. A lock that is gone by then is free, not an error for the sign-in.
+test("a lock released before it is looked at is free, not an error", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vertex-lock-"))
+  try {
+    assert.equal(await abandoned(join(directory, "balance.lock")), null)
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })

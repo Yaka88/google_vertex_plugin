@@ -3,13 +3,15 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import plugin from "../index.mjs"
 import { createHash } from "node:crypto"
+import { execFile } from "node:child_process"
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { delimiter, dirname, join } from "node:path"
 import { EventEmitter } from "node:events"
-import { accountOf, adcDirectoryFor, adcDirectoryOwnedBy, adcDirectoryToCreate, adcFile, adcSlug, beginAdcLogin, effectiveAuthMode, hasAdc, resolveAccount, resolveIdentity, resolveProject, runGcloud, startLogin, tokenProvider } from "../lib/credentials.mjs"
+import { promisify } from "node:util"
+import { accountOf, adcDirectoryFor, adcDirectoryOwnedBy, adcDirectoryToCreate, adcFile, adcSlug, beginAdcLogin, command, effectiveAuthMode, gcloudProgram, hasAdc, resolveAccount, resolveIdentity, resolveProject, runGcloud, startLogin, tokenProvider, windowsCommand } from "../lib/credentials.mjs"
 import { fakeGcloud } from "./gcloud.mjs"
-import { parseCreditTables, usageOf } from "../lib/credits.mjs"
+import { billingCurrenciesOf, consoleAccountFor, parseCreditTables, usageOf } from "../lib/credits.mjs"
 import { availableModels, toProviderModels } from "../lib/models.mjs"
 import { assertConsoleSession } from "../lib/browser.mjs"
 import { main } from "../lib/fetch_credits.mjs"
@@ -17,6 +19,32 @@ import { main } from "../lib/fetch_credits.mjs"
 const headers = ["Credit name", "Status", "Percent remaining", "Remaining value", "Original value", "Type", "Credit ID", "Usage scope", "Start date", "End date"]
 const row = (id, remaining, original = "$10.00", status = "Available", start = "July 15, 2026", end = "July 1, 2027") => ["Example benefit", status, "100%", remaining, original, "One-time", id, "All Google Cloud services", start, end]
 const now = Date.parse("2026-10-18T12:00:00Z")
+
+test("Console aliases are explicit, case-insensitive and scoped to the credential account", () => {
+  const aliases = { "OLD@example.com": "New@example.com" }
+  assert.equal(consoleAccountFor("old@example.com", aliases), "new@example.com")
+  assert.equal(consoleAccountFor("other@example.com", aliases), "other@example.com")
+  assert.equal(consoleAccountFor("old@example.com"), "old@example.com")
+  assert.equal(consoleAccountFor(undefined, {}), undefined)
+  assert.equal(consoleAccountFor("old@example.com", { ...aliases, "new@example.com": "third@example.com" }), "new@example.com")
+  for (const invalid of [null, [], "new@example.com", { "old@example.com": 42 }, { bad: "new@example.com" }]) {
+    assert.throws(() => consoleAccountFor("old@example.com", invalid))
+  }
+  assert.throws(() => consoleAccountFor(undefined, aliases), /requires a saved account/)
+  assert.throws(() => consoleAccountFor("old@example.com", { ...aliases, "old@example.com": "other@example.com" }), /Duplicate/)
+})
+
+test("the usage hook forwards Console aliases from provider options without rewriting authentication", async () => {
+  const hooks = await plugin()
+  const auth = { accountId: "old@example.com", authMode: "adc", cloudsdkConfig: "/original-adc" }
+  const before = { ...auth }
+  const usage = await hooks.auth.usage(async () => auth, {
+    options: { billingAccount: "AAAAAA-BBBBBB-CCCCCC", consoleAccountAliases: "invalid" },
+  })
+  assert.match(usage.error, /consoleAccountAliases must be an object/)
+  assert.equal(usage.signIn, "kept")
+  assert.deepEqual(auth, before)
+})
 
 test("credits sum active rows, deduplicate IDs, reject future/expired rows, and count exhausted grants", () => {
   const tables = [{ headers, rows: [row("a", "$10.00"), row("b", "$2.07"), row("b", "$2.07"), row("expired", "$262.09", "$300.00", "Expired"), row("future", "$10.00", "$10.00", "Available", "January 1, 2027"), row("used", "$0.00", "$10.00", "Exhausted")] }]
@@ -50,6 +78,135 @@ test("credits fail closed on missing layout, unknown statuses, unsupported curre
   assert.throws(() => parseCreditTables([{ headers, rows: [row("a", "€1.00")] }]), /currency/)
   assert.throws(() => parseCreditTables([{ headers, rows: [row("a", "$11.00")] }]), /Invalid/)
   assert.equal(parseCreditTables([{ headers, rows: [row("a", "$10.00", "$10.00", "Expired")] }], { now }).remaining, 0)
+})
+
+// kidchen94's JPY billing account (#667): yen amounts have no minor unit, and
+// a bare ¥ is never taken for yen unless the billing account is said to bill
+// in JPY, since the Console writes yuan with the same sign.
+test("a billing account named as JPY reads yen, and a ¥ is never guessed", () => {
+  const yen = (id, remaining, original = "¥10,000", status = "Available") => row(id, remaining, original, status)
+  const result = parseCreditTables([{ headers, rows: [yen("a", "¥8,500"), yen("b", "￥1,000"), yen("c", "JP¥0", "¥5,000", "Exhausted")] }], { now, currency: "JPY", billingAccount: "AAAAAA-BBBBBB-CCCCCC" })
+  assert.equal(result.currency, "JPY")
+  assert.equal(result.remaining, 9500)
+  assert.equal(result.original, 25000)
+  const usage = usageOf(result)
+  assert.equal(usage.balance, "¥9500 JPY")
+  assert.equal(usage.windows[0].display, "¥9500 remaining / ¥25000 JPY")
+  assert.equal(usage.windows[0].unit, "JPY")
+  // The same page read as the default USD names the currency and the switch.
+  assert.throws(() => parseCreditTables([{ headers, rows: [yen("a", "¥8,500")] }], { now, billingAccount: "AAAAAA-BBBBBB-CCCCCC" }),
+    /in ¥ \(yen or yuan\), not USD\. If it bills in Japanese yen, set billingCurrencies to \{ "AAAAAA-BBBBBB-CCCCCC": "JPY" \}/)
+  // A USD page read as JPY is not taken as yen either.
+  assert.throws(() => parseCreditTables([{ headers, rows: [row("a", "$10.00")] }], { now, currency: "JPY", billingAccount: "AAAAAA-BBBBBB-CCCCCC" }), /are in USD, not JPY/)
+  // Yen has no fraction, and a misplaced group separator is not a number.
+  assert.throws(() => parseCreditTables([{ headers, rows: [yen("a", "¥8,500.50")] }], { now, currency: "JPY" }), /Unsupported credit amount/)
+  assert.throws(() => parseCreditTables([{ headers, rows: [row("a", "$1,00.00")] }], { now }), /Unsupported credit amount/)
+  assert.throws(() => parseCreditTables([{ headers, rows: [row("a", "$1.00")] }], { now, currency: "CNY" }), /Unsupported billing currency CNY/)
+  // USD reads as it did.
+  assert.equal(parseCreditTables([{ headers, rows: [row("a", "$1,234.56", "$2,000.00"), row("b", "USD 1.00"), row("c", "2.00 USD")] }], { now }).remaining, 1237.56)
+})
+
+test("billingCurrencies names a supported currency for a valid billing account", () => {
+  assert.deepEqual([...billingCurrenciesOf({ "aaaaaa-bbbbbb-cccccc": "jpy" })], [["AAAAAA-BBBBBB-CCCCCC", "JPY"]])
+  assert.throws(() => billingCurrenciesOf({ "AAAAAA-BBBBBB-CCCCCC": "CNY" }), /not a currency this plugin reads/)
+  assert.throws(() => billingCurrenciesOf({ "not-an-account": "JPY" }), /billingCurrencies/)
+  assert.throws(() => billingCurrenciesOf("JPY"), /billingCurrencies must be an object/)
+})
+
+// What Chrome's translation left of the Console's table (#667): the column
+// names and the amounts rewritten. That is a page in another language, said as
+// such, not an expired session or an empty table.
+test("a credits table whose columns were translated says so", () => {
+  const translatedHeaders = ["クレジット名", "ステータス", "残りの割合", "残額", "元の値", "タイプ", "クレジット ID", "使用範囲", "開始日", "終了日"]
+  const translatedRow = ["特典の例", "利用可能", "100%", "10.00 米ドル", "10.00 米ドル", "1回限り", "a", "すべての Google Cloud サービス", "2026年7月15日", "2027年7月1日"]
+  assert.throws(() => parseCreditTables([{ headers: [], rows: [] }, { headers: translatedHeaders, rows: [translatedRow] }], { now }),
+    /columns are not the English ones this plugin reads \(it found: クレジット名, ステータス, 残りの割合, 残額, 元の値, タイプ\); the page may have been translated/)
+  // A page with no table at all is still the old answer.
+  assert.throws(() => parseCreditTables([]), /Credits table was not found/)
+})
+
+test("a credit near its end date reads as expiring, and is still spendable", () => {
+  const result = parseCreditTables([{ headers, rows: [row("expiring", "$229.42", "$300.00", "Expiring in 24 days", "August 20, 2026", "November 20, 2026")] }], { now })
+  assert.equal(result.remaining, 229.42)
+  assert.equal(result.original, 300)
+  assert.equal(result.runsOutAt, "2026-11-20T00:00:00.000Z")
+  assert.equal(result.credits[0].eligible, true)
+  assert.equal(result.credits[0].status, "Expiring in 24 days")
+})
+
+test("a credit whose end date has passed is not spendable whatever its status says", () => {
+  const result = parseCreditTables([{ headers, rows: [row("gone", "$10.00", "$10.00", "Expiring in 1 day", "August 20, 2025", "November 20, 2025")] }], { now })
+  assert.equal(result.credits[0].eligible, false)
+  assert.equal(result.remaining, 0)
+})
+
+test("the Windows command line quotes the program and every argument", () => {
+  const program = "C:\\Program Files\\Google\\Cloud SDK\\google-cloud-sdk\\bin\\gcloud.cmd"
+  assert.deepEqual(windowsCommand(program, ["auth", "application-default", "login"]), ["/d", "/s", "/c", `""${program}" "auth" "application-default" "login""`])
+})
+
+test("gcloud is found on PATH and named by its own path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "magpie-gcloud-path-"))
+  const bin = join(root, "Cloud SDK")
+  const sdk = join(root, "sdk")
+  try {
+    await mkdir(bin, { recursive: true })
+    await writeFile(join(bin, "gcloud.cmd"), "@echo off\r\n")
+    await mkdir(join(sdk, "bin"), { recursive: true })
+    await writeFile(join(sdk, "bin", "gcloud.cmd"), "@echo off\r\n")
+    // A PATH entry may be quoted, and the quotes are not part of the directory.
+    assert.equal(gcloudProgram({ PATH: `"${bin}"` }), join(bin, "gcloud.cmd"))
+    assert.equal(gcloudProgram({ PATH: [bin, root].join(delimiter) }), join(bin, "gcloud.cmd"))
+    // The SDK's own root variable names the same installation the SDK reports.
+    assert.equal(gcloudProgram({ CLOUDSDK_ROOT_DIR: sdk }), join(sdk, "bin", "gcloud.cmd"))
+    // Nothing to find: the name is left to the shell.
+    assert.equal(gcloudProgram({ PATH: root }), "gcloud")
+    assert.equal(gcloudProgram({}), "gcloud")
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("a Windows sign-in names gcloud by its own path, so the batch file finds its Cloud SDK root", { skip: process.platform !== "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "magpie-gcloud-cwd-"))
+  const bin = join(root, "Cloud SDK")
+  const elsewhere = join(root, "somewhere else")
+  await mkdir(bin, { recursive: true })
+  await mkdir(elsewhere, { recursive: true })
+  // A batch file prints the directory it was started in, and gcloud takes its
+  // Cloud SDK root from there.
+  await writeFile(join(bin, "gcloud.cmd"), "@echo off\r\necho dp0=%~dp0\r\n")
+  const path = process.env.PATH
+  const sdkRoot = process.env.CLOUDSDK_ROOT_DIR
+  process.env.PATH = bin
+  delete process.env.CLOUDSDK_ROOT_DIR
+  try {
+    // The batch file sees its own directory. Started by name it would see the
+    // caller's, which is where gcloud looks for its library and finds nothing.
+    const stdout = await runGcloud(["version"])
+    assert.ok(stdout.includes(bin), `expected the script's own directory, got ${stdout}`)
+    assert.ok(!stdout.includes(elsewhere), `expected not the caller's directory, got ${stdout}`)
+    // And the command line that got there names the file, not the name it has
+    // on PATH.
+    const started = command("gcloud", ["version"])
+    assert.ok(started.args[3].includes(bin), `the command line names ${started.args[3]}`)
+  } finally {
+    if (path === undefined) delete process.env.PATH
+    else process.env.PATH = path
+    if (sdkRoot !== undefined) process.env.CLOUDSDK_ROOT_DIR = sdkRoot
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("a Windows command line built this way starts the program it names", { skip: process.platform !== "win32" }, async () => {
+  const script = join(tmpdir(), `magpie-windows-command-${process.pid}.cmd`)
+  await writeFile(script, "@echo off\r\necho started\r\n")
+  try {
+    const { stdout } = await promisify(execFile)(process.env.ComSpec || "cmd.exe", windowsCommand(script, []), { windowsVerbatimArguments: true })
+    assert.match(stdout, /started/)
+  } finally {
+    await rm(script, { force: true })
+  }
 })
 
 test("session checking recovers from navigation context loss within the same deadline", async () => {
@@ -251,8 +408,11 @@ test("ADC setup reads gcloud's complete consent URL and distinguishes saved ADC 
 test("ADC uses only its own token command, never assumes the active gcloud account, and adds ADC only when there is none", { timeout: 30000 }, async () => {
   const fixture = await fakeGcloud()
   let login
-  const original = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: false })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://openidconnect.googleapis.com/v1/userinfo")
+    return { ok: true, json: async () => ({ email: "user@example.com", sub: "google-user-1" }) }
+  }
   try {
     await fixture.setAdc({})
     const identity = await resolveIdentity({ authMode: "adc" })
@@ -274,9 +434,10 @@ test("ADC uses only its own token command, never assumes the active gcloud accou
     // read for the gcloud identity, and no ADC login was run for them.
     assert.equal(result.project, "example-project")
     assert.equal(result.creditsSession, "ready")
+    assert.equal(result.subject, "google-user-1")
     assert.ok(!(await fixture.calls()).some((args) => args.includes("login")))
     await assert.rejects(tokenProvider({ authMode: "unknown" })(), /must be auto, gcloud or adc/)
-  } finally { await login?.close(); globalThis.fetch = original; await fixture.close() }
+  } finally { await login?.close(); globalThis.fetch = originalFetch; await fixture.close() }
 })
 
 test("auto mode prefers ADC like official Vertex clients, takes its quota project, and falls back to gcloud", { timeout: 30000 }, async () => {
@@ -306,13 +467,14 @@ test("auto mode prefers ADC like official Vertex clients, takes its quota projec
   } finally { globalThis.fetch = original; await fixture.close() }
 })
 
-test("a sign-in with an ADC the plugin already filed counts as an overwrite and fails", { timeout: 30000 }, async () => {
+test("a sign-in resolves the Google subject before rejecting an existing ADC account", { timeout: 30000 }, async () => {
   const fixture = await fakeGcloud()
   let login
   const original = globalThis.fetch
   globalThis.fetch = mockFetch()
   const root = join(fixture.directory, "plugin")
   try {
+    await fixture.set({ token: "user@example.com", pendingToken: "user@example.com" })
     // The plugin's own ADC for this account is the overwrite. gcloud's
     // machine-wide one is not: it belongs to gcloud, is only ever read, and a
     // sign-in writes this plugin's credential beside it.
@@ -332,8 +494,9 @@ test("a sign-in with an ADC the plugin already filed counts as an overwrite and 
     const result = await login.result
     assert.equal(result.creditsSession, "unavailable")
     assert.match(result.warning, /already signed in|ADC already existed/i)
-    // Refused before anything opened: no window, and the ADC is as it was.
-    assert.deepEqual(visited, [])
+    // Consent identifies the subject in a staging directory. The original ADC
+    // is never overwritten, even though another consent window was opened.
+    assert.equal(visited.length, 1)
     assert.equal(await readFile(join(own, "application_default_credentials.json"), "utf8").then((text) => JSON.parse(text).refresh_token), "refresh")
   } finally { await login?.close(); globalThis.fetch = original; await fixture.close() }
 })
@@ -422,12 +585,15 @@ function profileOf(accounts, project = "adc-project", added = accounts.at(-1)) {
 }
 
 // Routes fetch requests by URL host for testing sign-in and project listing.
-const mockFetch = (projects = [{ projectId: "example-project", name: "Example Project", lifecycleState: "ACTIVE" }]) => async (url, init) => {
+const mockFetch = (projects = [{ projectId: "example-project", name: "Example Project", lifecycleState: "ACTIVE" }], subject) => async (url, init) => {
   const parsed = new URL(url)
   if (parsed.host === "openidconnect.googleapis.com") {
     return {
       ok: true,
-      json: async () => ({ email: String(init.headers.authorization).replace(/^Bearer /, "") }),
+      json: async () => ({
+        email: String(init.headers.authorization).replace(/^Bearer /, ""),
+        sub: subject ?? `subject-${createHash("sha256").update(init.headers.authorization).digest("hex")}`,
+      }),
     }
   }
   if (parsed.host === "cloudresourcemanager.googleapis.com") {
@@ -454,7 +620,7 @@ test("a named sign-in saves its own ADC and refuses a later duplicate", { timeou
   let login
   let duplicate
   const original = globalThis.fetch
-  globalThis.fetch = mockFetch()
+  globalThis.fetch = mockFetch(undefined, "google-user-1")
   try {
     const account = "me@example.com"
     const root = join(fixture.directory, "plugin")
@@ -463,7 +629,7 @@ test("a named sign-in saves its own ADC and refuses a later duplicate", { timeou
     const visited = []
     login = await startLogin({ adcRoot: root, account }, signInWindowOf(visited))
     assert.deepEqual(await login.result, {
-      project: "example-project", account, source: "gcloud", authMode: "adc", cloudsdkConfig: own, creditsSession: "ready",
+      project: "example-project", account, accountId: account, subject: "google-user-1", source: "gcloud", authMode: "adc", cloudsdkConfig: own, creditsSession: "ready",
     })
     assert.equal(visited.length, 1)
     const file = join(own, "application_default_credentials.json")
@@ -472,7 +638,7 @@ test("a named sign-in saves its own ADC and refuses a later duplicate", { timeou
     assert.equal(await adcDirectoryOwnedBy(account, root), own)
     duplicate = await startLogin({ adcRoot: root, account }, signInWindowOf(visited))
     assert.match((await duplicate.result).warning, /already signed in/)
-    assert.equal(visited.length, 1)
+    assert.equal(visited.length, 2)
     assert.equal(await readFile(file, "utf8"), saved)
     assert.deepEqual(await readdir(root), ["adc-me-example-com"])
   } finally { await login?.close(); await duplicate?.close(); globalThis.fetch = original; await fixture.close() }
@@ -1061,4 +1227,36 @@ test("account settings beat the row, and row settings beat environment defaults"
     else process.env.XDG_CACHE_HOME = previousCache
     await fixture.close()
   }
+})
+
+test("the usage hook takes the billing, currency and profile maps from the provider's or the plugin's options", async () => {
+  // No account: nothing asks gcloud for a token before the options are read.
+  const auth = { type: "success" }
+  for (const [name, bad, wanted] of [
+    ["billingAccounts", { "example-project": "nope" }, /billingAccounts: /],
+    ["billingCurrencies", { "AAAAAA-BBBBBB-CCCCCC": "EUR" }, /billingCurrencies: "EUR" is not a currency/],
+    ["profileDirectories", { "reader@example.com": "../elsewhere" }, /profileDirectories: Invalid Chrome profile directory/],
+  ]) {
+    const fromRow = await (await plugin()).auth.usage(async () => auth, { options: { billingAccount: "AAAAAA-BBBBBB-CCCCCC", [name]: bad } })
+    assert.match(fromRow.error, wanted)
+    assert.equal(fromRow.signIn, "kept")
+    const fromPlugin = await (await plugin({}, { [name]: bad })).auth.usage(async () => auth, { options: { billingAccount: "AAAAAA-BBBBBB-CCCCCC" } })
+    assert.match(fromPlugin.error, wanted)
+  }
+  const pinned = await (await plugin()).auth.usage(async () => auth, { options: { billingAccount: "AAAAAA-BBBBBB-CCCCCC", profileDirectory: "-flag" } })
+  assert.match(pinned.error, /Invalid Chrome profile directory/)
+  const pinnedByPlugin = await (await plugin({}, { profileDirectory: "a/b" })).auth.usage(async () => auth, { options: { billingAccount: "AAAAAA-BBBBBB-CCCCCC" } })
+  assert.match(pinnedByPlugin.error, /Invalid Chrome profile directory/)
+})
+
+test("usage accepts plugin-level aliases while provider options take precedence", async () => {
+  const hooks = await plugin({}, { consoleAccountAliases: "invalid-plugin-aliases" })
+  const auth = { accountId: "old@example.com" }
+  const provider = { options: { billingAccount: "AAAAAA-BBBBBB-CCCCCC" } }
+  const usage = await hooks.auth.usage(async () => auth, provider)
+  assert.match(usage.error, /consoleAccountAliases must be an object/)
+  const override = await hooks.auth.usage(async () => auth, {
+    options: { ...provider.options, consoleAccountAliases: { "old@example.com": "invalid-email" } },
+  })
+  assert.match(override.error, /intended Google account email/)
 })
