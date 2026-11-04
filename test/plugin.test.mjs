@@ -116,6 +116,40 @@ test("gcloud tokens merge concurrent requests and delegate expiry checks and ren
   } finally { await fixture.close() }
 })
 
+test("ADC refresh caches, expires early, merges requests and falls back safely", async () => {
+  const fixture = await fakeGcloud()
+  const originalNow = Date.now
+  try {
+    await fixture.setAdc()
+    let now = 1000000, calls = 0, fallback = 0
+    Date.now = () => now
+    const request = async (url, init) => {
+      calls++
+      assert.equal(url, "https://oauth2.googleapis.com/token")
+      assert.equal(init.body.get("client_id"), "id")
+      assert.equal(init.body.get("client_secret"), "secret")
+      assert.equal(init.body.get("refresh_token"), "refresh")
+      assert.equal(init.body.get("grant_type"), "refresh_token")
+      return { ok: true, json: async () => ({ access_token: `token-${calls}`, expires_in: 120 }) }
+    }
+    const run = async () => { fallback++; return "fallback" }
+    const getToken = tokenProvider({ authMode: "adc" }, run, request)
+    assert.deepEqual(await Promise.all([getToken(), getToken(), getToken()]), ["token-1", "token-1", "token-1"])
+    now += 59000
+    assert.equal(await getToken(), "token-1")
+    now += 1000
+    assert.equal(await getToken(), "token-2")
+    assert.equal(fallback, 0)
+    const failing = tokenProvider({ authMode: "adc" }, run, async () => { throw new Error("secret") })
+    assert.equal(await failing(), "fallback")
+    assert.equal(fallback, 1)
+    const defaults = tokenProvider({ authMode: "adc" }, run, async () => ({ ok: true, json: async () => ({ access_token: "default-token" }) }))
+    assert.equal(await defaults(), "default-token")
+    now += 2939000
+    assert.equal(await defaults(), "default-token")
+  } finally { Date.now = originalNow; await fixture.close() }
+})
+
 test("CLI verifies gcloud without exposing tokens and rejects all removed key flags", { timeout: 30000 }, async () => {
   for (const flag of ["--source-key", "--key-path", "--service-account"]) {
     await assert.rejects(main(["credentials", flag, "/unused.json"]), /Unknown option/)
@@ -217,6 +251,8 @@ test("ADC setup reads gcloud's complete consent URL and distinguishes saved ADC 
 test("ADC uses only its own token command, never assumes the active gcloud account, and adds ADC only when there is none", { timeout: 30000 }, async () => {
   const fixture = await fakeGcloud()
   let login
+  const original = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: false })
   try {
     await fixture.setAdc({})
     const identity = await resolveIdentity({ authMode: "adc" })
@@ -240,11 +276,13 @@ test("ADC uses only its own token command, never assumes the active gcloud accou
     assert.equal(result.creditsSession, "ready")
     assert.ok(!(await fixture.calls()).some((args) => args.includes("login")))
     await assert.rejects(tokenProvider({ authMode: "unknown" })(), /must be auto, gcloud or adc/)
-  } finally { await login?.close(); await fixture.close() }
+  } finally { await login?.close(); globalThis.fetch = original; await fixture.close() }
 })
 
 test("auto mode prefers ADC like official Vertex clients, takes its quota project, and falls back to gcloud", { timeout: 30000 }, async () => {
   const fixture = await fakeGcloud()
+  const original = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: false })
   try {
     // No ADC file: the gcloud user login remains the identity.
     assert.equal(await effectiveAuthMode(), "gcloud")
@@ -265,7 +303,7 @@ test("auto mode prefers ADC like official Vertex clients, takes its quota projec
     process.env.GOOGLE_APPLICATION_CREDENTIALS = explicit
     assert.equal(await effectiveAuthMode(), "adc")
     assert.equal(await adcFile(), explicit)
-  } finally { await fixture.close() }
+  } finally { globalThis.fetch = original; await fixture.close() }
 })
 
 test("a sign-in with an ADC the plugin already filed counts as an overwrite and fails", { timeout: 30000 }, async () => {
@@ -759,7 +797,7 @@ test("plugin is its own gcp-ai row, not Magpie's built-in Vertex provider", { ti
     assert.deepEqual(fallback, info.models)
     assert.equal(fallback.id, undefined)
     assert.equal(fallback.source, undefined)
-    assert.equal(requests, 1)
+    assert.equal(requests, 2)
   } finally {
     globalThis.fetch = original
     await fixture.close()
@@ -929,6 +967,41 @@ test("closing a login waits for its pending identity work before fetch is restor
   }
 })
 
+test("background endpoint probe does not block requests and shares failures", async () => {
+  const original = globalThis.fetch
+  const entered = Promise.withResolvers(), release = Promise.withResolvers(), finished = Promise.withResolvers()
+  let probes = 0, models = 0
+  globalThis.fetch = async (input) => {
+    const url = String(input.url ?? input)
+    if (url.includes("/v1/projects/")) {
+      probes++
+      entered.resolve()
+      await release.promise
+      finished.resolve()
+      return { ok: false, status: 401, json: async () => ({}) }
+    }
+    models++
+    return new Response("{}")
+  }
+  try {
+    const hooks = await plugin()
+    const auth = { project: "probe-project", accountId: "probe@example.com", authMode: "gcloud" }
+    const fixture = await fakeGcloud()
+    try {
+      const first = await hooks.auth.loader(async () => auth)
+      const second = await hooks.auth.loader(async () => auth)
+      await entered.promise
+      await first.fetch(`${first.baseURL}/models/gemini-2.5-flash:generateContent`)
+      assert.equal(models, 1)
+      assert.equal(probes, 1)
+      release.resolve()
+      await finished.promise
+      await new Promise((resolve) => setImmediate(resolve))
+      await assert.rejects(second.fetch(`${second.baseURL}/models/gemini-2.5-flash:generateContent`), /endpoint is not usable/)
+    } finally { release.resolve(); await fixture.close() }
+  } finally { globalThis.fetch = original }
+})
+
 test("account settings beat the row, and row settings beat environment defaults", { timeout: 30000 }, async () => {
   const fixture = await fakeGcloud()
   const original = globalThis.fetch
@@ -942,8 +1015,12 @@ test("account settings beat the row, and row settings beat environment defaults"
     billingAccount: "DDDDDD-EEEEEE-FFFFFF", profile: join(fixture.directory, "account-profile"), cloudsdkConfig: join(fixture.directory, "account-sdk"),
   }
   const requests = []
+  const probesFinished = Promise.withResolvers()
+  let probes = 0
   globalThis.fetch = async (input) => {
-    requests.push(String(input))
+    const url = String(input.url ?? input)
+    requests.push(url)
+    if (url.includes(":countTokens") && ++probes === 3) probesFinished.resolve()
     return { ok: true, status: 200, json: async () => ({}) }
   }
   try {
@@ -961,6 +1038,7 @@ test("account settings beat the row, and row settings beat environment defaults"
     for (const [record, expected] of [[auth, { ...auth, account: auth.accountId }], [{ ...auth, accountId: undefined }, auth], [{}, options]]) {
       const loaded = await hooks.auth.loader(async () => record, { options })
       assert.ok(loaded.baseURL.includes(`/projects/${expected.project}/locations/${expected.location}/`))
+      await loaded.fetch(`${loaded.baseURL}/models/gemini-2.5-flash:generateContent`)
       const calls = await fixture.calls()
       assert.ok(calls.some((args) => expected.authMode === "adc" ? args.includes("application-default") : args.includes(`--account=${expected.account}`)))
       // The cache identifies project, billing account, profile, account and ADC
@@ -974,6 +1052,7 @@ test("account settings beat the row, and row settings beat environment defaults"
       const usage = await hooks.auth.usage(async () => ({ ...record, accountId: expected.account }), { options })
       assert.equal(usage.error, `cached settings for ${expected.account}`)
     }
+    await probesFinished.promise
     assert.ok(requests.some((url) => url.includes("/projects/account-project/locations/europe-west1")))
     assert.ok(requests.some((url) => url.includes("/projects/row-project/locations/us-central1")))
   } finally {

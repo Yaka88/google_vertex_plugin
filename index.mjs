@@ -69,19 +69,28 @@ function geminiRoute(pathname, base) {
 // in". The token can tell the host that account once; it is written back so
 // later reads of the sign-in are labelled without asking Google again.
 const named = new Set()
-// One probe per project and location per process: the answer cannot change
-// between two model calls in the same run, and the same run's later loads
-// should not ask Google again.
-const tested = new Set()
+// A successful probe is remembered for the process. A failure only lasts long
+// enough to avoid repeating a failing check on every load; a later load can
+// probe again after the endpoint or credentials recover.
+const tested = new Map()
 
-async function endorse(identity, location, owner) {
+function endorse(identity, location, owner) {
   // Two accounts can serve the same project and location; the probe is about
-  // the credential, so it is remembered per account, not per address.
-  const key = `${owner ?? identity.project}/${identity.project}/${location}`
-  if (tested.has(key)) return
-  const report = await testEndpoint({ ...identity, location }, { models: [], timeout: 15000 })
-  if (!report.reachable) throw new Error(`The Google model endpoint is not usable for ${identity.project} (${location}); check that the project exists, the Vertex AI API is enabled and the account may use it`)
-  tested.add(key)
+  // the credential, so it is remembered per account, not per address. Share
+  // the state while it runs so neither a loader nor a model request waits for it.
+  const key = JSON.stringify([owner, identity.account, identity.authMode, identity.cloudsdkConfig, identity.project, location])
+  if (!tested.has(key)) {
+    const state = {}
+    tested.set(key, state)
+    void testEndpoint({ ...identity, location }, { models: [], timeout: 15000 }).then((report) => {
+      if (!report.reachable) throw new Error(`The Google model endpoint is not usable for ${identity.project} (${location}); check that the project exists, the Vertex AI API is enabled and the account may use it`)
+    }).catch((error) => {
+      state.error = error
+      const timer = setTimeout(() => { if (tested.get(key) === state) tested.delete(key) }, 60000)
+      timer.unref?.()
+    })
+  }
+  return key
 }
 
 async function label(client, auth, account) {
@@ -182,16 +191,16 @@ export const GoogleVertexAuthPlugin = async (input = {}) => {
         const identity = await resolveIdentity(options)
         const baseURL = endpoint(identity.project, options.location)
         const getToken = tokenProvider(identity)
-        // The host has no test button of its own, so the first request after a
-        // sign-in is where an unusable endpoint is named. Reading the location
-        // resource is free, runs once per project, and turns a bad project or a
-        // disabled API into a clear error instead of a failed model call. No
-        // model is asked anything: that is the person's test to make.
-        await endorse(identity, options.location, auth?.accountId ?? auth?.project ?? identity.project)
+        // Probe in the background so a slow location check does not hold up the
+        // first model request. Later requests surface a failed probe, and other
+        // loaders for the same credential share the result.
+        const probeKey = endorse(identity, options.location, auth?.accountId ?? auth?.project ?? identity.project)
         const allowed = new URL(baseURL)
         return {
           baseURL, apiKey: "vertex-managed",
           async fetch(input, init) {
+            const probe = tested.get(probeKey)
+            if (probe?.error) throw probe.error
             const request = new Request(input, init)
             const url = new URL(request.url)
             if (url.origin !== allowed.origin || !url.pathname.startsWith(allowed.pathname + "/")) throw new Error("Refusing to send a Vertex credential outside the configured Google model endpoint")

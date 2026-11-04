@@ -1,6 +1,6 @@
 {
-  "name": "@magpie-community/gcp-ai",
-  "version": "0.1.0",
+  "name": "@magpie-community/opencode-gcp-ai-auth",
+  "version": "0.2.0",
   "description": "Vertex AI models and Google Cloud promotional credits, signed with your own gcloud / ADC login",
   "type": "module",
   "main": "./index.mjs",
@@ -41,6 +41,7 @@
     "quota"
   ],
   "license": "MIT",
+  "author": "Yaka (https://github.com/Yaka88)",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Yaka88/google_vertex_plugin.git"
