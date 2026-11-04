@@ -300,12 +300,88 @@ test("ADC refresh caches, expires early, merges requests and falls back safely",
     const failing = tokenProvider({ authMode: "adc" }, run, async () => { throw new Error("secret") })
     assert.equal(await failing(), "fallback")
     assert.equal(fallback, 1)
-    const defaults = tokenProvider({ authMode: "adc" }, run, async () => ({ ok: true, json: async () => ({ access_token: "default-token" }) }))
-    assert.equal(await defaults(), "default-token")
-    now += 2939000
-    assert.equal(await defaults(), "default-token")
   } finally { Date.now = originalNow; await fixture.close() }
 })
+
+test("ADC tokens are cached only with a usable expiry beyond the renewal margin", async () => {
+  const fixture = await fakeGcloud()
+  try {
+    await fixture.setAdc()
+    for (const lifetime of [undefined, null, "3600", 0, -1, NaN, Infinity, 30, 60, 120]) {
+      let calls = 0
+      const request = async () => {
+        const token = `token-${++calls}`
+        return { ok: true, json: async () => ({ access_token: token, ...(lifetime === undefined ? {} : { expires_in: lifetime }) }) }
+      }
+      const getToken = tokenProvider({ authMode: "adc" }, () => assert.fail("A valid OAuth token should not fall back to gcloud"), request)
+      assert.equal(await getToken(), "token-1")
+      const cached = lifetime === 120
+      assert.equal(await getToken(), cached ? "token-1" : "token-2")
+      assert.equal(calls, cached ? 1 : 2, `expires_in=${lifetime}`)
+    }
+  } finally { await fixture.close() }
+})
+
+test("token invalidation clears shared cached and pending tokens without restoring an old refresh", async () => {
+  const fixture = await fakeGcloud()
+  const entered = Promise.withResolvers(), release = Promise.withResolvers()
+  let pending
+  try {
+    await fixture.setAdc()
+    let calls = 0
+    const request = async () => {
+      const call = ++calls
+      if (call === 1) { entered.resolve(); await release.promise }
+      return { ok: true, json: async () => ({ access_token: `token-${call}`, expires_in: 3600 }) }
+    }
+    const run = () => assert.fail("OAuth should supply the token")
+    const first = tokenProvider({ authMode: "adc" }, run, request)
+    const second = tokenProvider({ authMode: "adc" }, run, request)
+    pending = first()
+    await entered.promise
+    second.invalidate()
+    assert.equal(await second(), "token-2")
+    release.resolve()
+    assert.equal(await pending, "token-1")
+    assert.equal(await first(), "token-2")
+    first.invalidate()
+    assert.equal(await second(), "token-3")
+    assert.equal(calls, 3)
+  } finally { release.resolve(); await pending; await fixture.close() }
+})
+
+for (const authMode of ["gcloud", "adc"]) {
+  test(`${authMode} accounts sharing a project keep concurrent and subsequent tokens separate`, async () => {
+    const fixture = await fakeGcloud()
+    try {
+      await fixture.setAdc()
+      let calls = 0
+      const run = async (args, options) => {
+        assert.equal(authMode, "gcloud")
+        assert.ok(args.includes(`--account=${options.account}`))
+        calls++
+        await new Promise((resolve) => setImmediate(resolve))
+        return `token-${options.account}`
+      }
+      const request = async () => {
+        assert.equal(authMode, "adc")
+        const token = `token-${++calls}`
+        return { ok: true, json: async () => ({ access_token: token, expires_in: 3600 }) }
+      }
+      // only the account differs, so another key field cannot hide a collision.
+      const options = { project: "shared-project", cloudsdkConfig: fixture.sdk, authMode }
+      const first = tokenProvider({ ...options, account: "first@example.com" }, run, request)
+      const second = tokenProvider({ ...options, account: "second@example.com" }, run, request)
+      const tokens = await Promise.all([first(), second()])
+      assert.equal(new Set(tokens).size, 2)
+      assert.equal(calls, 2)
+      if (authMode === "gcloud") assert.deepEqual(tokens, ["token-first@example.com", "token-second@example.com"])
+      assert.equal(await first(), tokens[0])
+      assert.equal(await second(), tokens[1])
+      assert.equal(calls, authMode === "adc" ? 2 : 4)
+    } finally { await fixture.close() }
+  })
+}
 
 test("CLI verifies gcloud without exposing tokens and rejects all removed key flags", { timeout: 30000 }, async () => {
   for (const flag of ["--source-key", "--key-path", "--service-account"]) {
@@ -1132,6 +1208,89 @@ test("closing a login waits for its pending identity work before fetch is restor
     await fixture.close()
   }
 })
+
+for (const retryStatus of [200, 401]) {
+  test(`a model 401 refreshes the cached token and retries once even when the retry returns ${retryStatus}`, async () => {
+    const fixture = await fakeGcloud()
+    const original = globalThis.fetch
+    const probed = Promise.withResolvers()
+    let tokens = 0, models = 0
+    const body = JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hello" }] }] })
+    globalThis.fetch = async (input) => {
+      const url = String(input.url ?? input)
+      if (url === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: `token-${++tokens}`, expires_in: 3600 })
+      }
+      if (url.includes("/v1/projects/")) {
+        probed.resolve()
+        return Response.json({}, { status: 403 })
+      }
+      models++
+      assert.equal(input.headers.get("authorization"), `Bearer token-${models}`)
+      assert.equal(input.headers.get("x-goog-user-project"), "retry-project")
+      assert.equal(input.headers.get("x-goog-api-key"), null)
+      assert.equal(input.headers.get("x-api-key"), null)
+      assert.equal(input.headers.get("content-type"), "application/json")
+      assert.equal(input.redirect, "error")
+      assert.equal(input.method, "POST")
+      assert.equal(await input.text(), body)
+      return Response.json({ attempt: models }, { status: models === 1 ? 401 : retryStatus })
+    }
+    try {
+      await fixture.setAdc()
+      const hooks = await plugin()
+      const auth = { project: "retry-project", accountId: "retry@example.com", authMode: "adc", cloudsdkConfig: fixture.sdk }
+      const loaded = await hooks.auth.loader(async () => auth)
+      await probed.promise
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(tokens, 1)
+      const response = await loaded.fetch(`${loaded.baseURL}/models/gemini-2.5-flash:generateContent`, {
+        method: "POST", body,
+        headers: { "content-type": "application/json", "x-goog-api-key": "removed", "x-api-key": "removed", authorization: "Bearer replaced" },
+      })
+      assert.equal(response.status, retryStatus)
+      assert.deepEqual(await response.json(), { attempt: 2 })
+      assert.equal(tokens, 2)
+      assert.equal(models, 2)
+    } finally { globalThis.fetch = original; await fixture.close() }
+  })
+}
+
+for (const status of [429, 500, 502, 503, 504, "network", 401]) {
+  test(`a background probe returning ${status} ${status === 401 ? "blocks" : "does not block"} a later model request`, async () => {
+    const fixture = await fakeGcloud()
+    const original = globalThis.fetch
+    const probed = Promise.withResolvers()
+    let models = 0
+    globalThis.fetch = async (input) => {
+      const url = String(input.url ?? input)
+      if (url === "https://oauth2.googleapis.com/token") return Response.json({ access_token: "probe-token", expires_in: 3600 })
+      if (url.includes("/v1/projects/")) {
+        probed.resolve()
+        if (status === "network") throw new Error("offline")
+        return Response.json({}, { status })
+      }
+      models++
+      return new Response("{}")
+    }
+    try {
+      await fixture.setAdc()
+      const hooks = await plugin()
+      const auth = { project: "transient-project", accountId: "probe@example.com", authMode: "adc", cloudsdkConfig: fixture.sdk }
+      const loaded = await hooks.auth.loader(async () => auth)
+      await probed.promise
+      await new Promise((resolve) => setImmediate(resolve))
+      const response = loaded.fetch(`${loaded.baseURL}/models/gemini-2.5-flash:generateContent`)
+      if (status === 401) {
+        await assert.rejects(response, /endpoint is not usable/)
+        assert.equal(models, 0)
+      } else {
+        assert.equal((await response).status, 200)
+        assert.equal(models, 1)
+      }
+    } finally { globalThis.fetch = original; await fixture.close() }
+  })
+}
 
 test("background endpoint probe does not block requests and shares failures", async () => {
   const original = globalThis.fetch

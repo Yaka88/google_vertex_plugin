@@ -6,15 +6,6 @@
 
 You sign in once with your own Google account. No service accounts, no JSON keys, no extra packages: the plugin uses the Chrome you already have.
 
-## What changed in 0.2.0 — token caching and request latency
-
-Two fixes take the plugin's own cost out of every request:
-
-- **One access token per account, not one per request.** Every `tokenProvider()` call used to spawn `gcloud auth print-access-token` again, so each model request — and each background probe — paid a process spawn and a Google round-trip for a token that had not expired. Tokens are now cached per account until 60 seconds before their expiry, refreshed directly against Google's OAuth token endpoint for an `authorized_user` ADC (no subprocess), and concurrent callers share one in-flight refresh instead of racing each other. A token is now fetched at most once an hour per account, not once per request.
-- **The endpoint probe no longer blocks the first request.** `endorse()` was awaited before the first model call with a 15-second timeout, and a failure was remembered for the life of the process. The probe now runs in the background: the first request is sent immediately, a failure surfaces on later requests, and it is retried after 60 seconds instead of sticking forever.
-
-Together these remove the plugin from the latency path. What is left in a request is Google's own time to first token — the plugin adds no token fetch and no endpoint check in front of it.
-
 ## Requirements
 
 - Google Chrome or Chromium (set `VERTEX_CHROME_PATH` if it is somewhere unusual)
@@ -38,9 +29,7 @@ plugin's own files — is implemented and covered by the unit tests' path handli
 **has not been run on a Windows machine with a real account**. If it misbehaves there,
 that is why; macOS has likewise not been tried with a real account.
 
-## Download and Install
-
-[github.com/Yaka88/google_vertex_plugin](https://github.com/Yaka88/google_vertex_plugin)
+## Install and sign in
 
 ```bash
 magpie plugin add @magpie-community/opencode-gcp-ai-auth
@@ -150,3 +139,7 @@ A machine-wide `CLOUDSDK_CONFIG` is never read. It would point every account at 
 ## Privacy
 
 The plugin asks Google for your model list with your credentials, sends inference requests to the Vertex endpoint, and opens Cloud Console in a Chrome it started to read your credits. No third-party server, no credential upload, no debugging port.
+
+## Source and history
+
+The plugin's development history is at [github.com/Yaka88/google_vertex_plugin](https://github.com/Yaka88/google_vertex_plugin); releases are served from this repository.

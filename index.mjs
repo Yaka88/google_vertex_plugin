@@ -82,9 +82,8 @@ function geminiRoute(pathname, base) {
   return GEMINI_ROUTE.test(pathname.slice(base.length))
 }
 
-// A successful probe is remembered for the process. A failure only lasts long
-// enough to avoid repeating a failing check on every load; a later load can
-// probe again after the endpoint or credentials recover.
+// A probe is remembered for the process, but only a credential refusal blocks
+// requests. That verdict expires so a later load can retry recovered credentials.
 const tested = new Map()
 
 function endorse(identity, location, owner) {
@@ -96,12 +95,11 @@ function endorse(identity, location, owner) {
     const state = {}
     tested.set(key, state)
     void testEndpoint({ ...identity, location }, { models: [], timeout: 15000 }).then((report) => {
-      if (!report.reachable) throw new Error(`The Google model endpoint is not usable for ${identity.project} (${location}); check that the project exists, the Vertex AI API is enabled and the account may use it`)
-    }).catch((error) => {
-      state.error = error
+      if (report.locationTest?.status !== 401) return
+      state.error = new Error(`The Google model endpoint is not usable for ${identity.project} (${location}); check that the project exists, the Vertex AI API is enabled and the account may use it`)
       const timer = setTimeout(() => { if (tested.get(key) === state) tested.delete(key) }, 60000)
       timer.unref?.()
-    })
+    }).catch(() => {})
   }
   return key
 }
@@ -201,7 +199,7 @@ export const GoogleVertexAuthPlugin = async (input = {}, pluginOptions = {}) => 
         const baseURL = endpoint(identity.project, options.location)
         const getToken = tokenProvider(identity)
         // Probe in the background so a slow location check does not hold up the
-        // first model request. Later requests surface a failed probe, and other
+        // first model request. Only a credential refusal blocks later requests;
         // loaders for the same credential share the result.
         const probeKey = endorse(identity, options.location, auth?.accountId ?? auth?.project ?? identity.project)
         const allowed = new URL(baseURL)
@@ -219,7 +217,13 @@ export const GoogleVertexAuthPlugin = async (input = {}, pluginOptions = {}) => 
             headers.delete("x-api-key")
             headers.set("authorization", `Bearer ${await getToken()}`)
             headers.set("x-goog-user-project", identity.project)
-            return fetch(new Request(request, { headers, redirect: "error" }))
+            // Keep the body available if Vertex rejects a cached credential.
+            const retry = request.clone()
+            const response = await fetch(new Request(request, { headers, redirect: "error" }))
+            if (response.status !== 401) return response
+            getToken.invalidate()
+            headers.set("authorization", `Bearer ${await getToken()}`)
+            return fetch(new Request(retry, { headers, redirect: "error" }))
           },
         }
       },
