@@ -1261,12 +1261,13 @@ for (const status of [429, 500, 502, 503, 504, "network", 401]) {
     const fixture = await fakeGcloud()
     const original = globalThis.fetch
     const probed = Promise.withResolvers()
-    let models = 0
+    let models = 0, projectReads = 0
     globalThis.fetch = async (input) => {
       const url = String(input.url ?? input)
       if (url === "https://oauth2.googleapis.com/token") return Response.json({ access_token: "probe-token", expires_in: 3600 })
       if (url.includes("/v1/projects/")) {
-        probed.resolve()
+        // A 401 is retried once with a fresh token before the verdict is kept.
+        if (++projectReads === (status === 401 ? 2 : 1)) probed.resolve()
         if (status === "network") throw new Error("offline")
         return Response.json({}, { status })
       }
@@ -1292,6 +1293,50 @@ for (const status of [429, 500, 502, 503, 504, "network", 401]) {
   })
 }
 
+test("a probe refused a stale cached token refreshes it and does not block requests", async () => {
+  const fixture = await fakeGcloud()
+  const original = globalThis.fetch
+  const refreshed = Promise.withResolvers()
+  let tokens = 0, reads = 0, models = 0
+  globalThis.fetch = async (input, init) => {
+    const url = String(input?.url ?? input)
+    if (url === "https://oauth2.googleapis.com/token") return Response.json({ access_token: `token-${++tokens}`, expires_in: 3600 })
+    const token = (input instanceof Request ? input.headers : new Headers(init?.headers)).get("authorization")
+    if (url.includes("/v1/projects/")) {
+      if (url.includes(":countTokens")) return Response.json({ totalTokens: 1 })
+      reads++
+      // The cached token is refused; only a token minted after the refresh works.
+      if (token === "Bearer token-1") return Response.json({}, { status: 401 })
+      refreshed.resolve()
+      return Response.json({}, { status: 200 })
+    }
+    models++
+    assert.equal(token, "Bearer token-2")
+    return new Response("{}")
+  }
+  try {
+    await fixture.setAdc()
+    const auth = { project: "stale-project", accountId: "stale@example.com", authMode: "adc", cloudsdkConfig: fixture.sdk }
+    // A token an earlier read already cached, as the models hook does before a loader.
+    await tokenProvider({ project: auth.project, account: auth.accountId, source: "gcloud", authMode: "adc", cloudsdkConfig: fixture.sdk })()
+    assert.equal(tokens, 1)
+    const hooks = await plugin()
+    const loaded = await hooks.auth.loader(async () => auth)
+    let timer
+    await Promise.race([
+      refreshed.promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("the probe did not retry after the 401")), 2000) }),
+    ])
+    clearTimeout(timer)
+    await new Promise((resolve) => setImmediate(resolve))
+    const response = await loaded.fetch(`${loaded.baseURL}/models/gemini-2.5-flash:generateContent`)
+    assert.equal(response.status, 200)
+    assert.equal(tokens, 2)
+    assert.equal(reads, 2)
+    assert.equal(models, 1)
+  } finally { globalThis.fetch = original; await fixture.close() }
+})
+
 test("background endpoint probe does not block requests and shares failures", async () => {
   const original = globalThis.fetch
   const entered = Promise.withResolvers(), release = Promise.withResolvers(), finished = Promise.withResolvers()
@@ -1302,7 +1347,8 @@ test("background endpoint probe does not block requests and shares failures", as
       probes++
       entered.resolve()
       await release.promise
-      finished.resolve()
+      // The 401 is retried once with a fresh token before the verdict is kept.
+      if (probes === 2) finished.resolve()
       return { ok: false, status: 401, json: async () => ({}) }
     }
     models++

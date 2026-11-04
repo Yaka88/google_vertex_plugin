@@ -94,7 +94,14 @@ function endorse(identity, location, owner) {
   if (!tested.has(key)) {
     const state = {}
     tested.set(key, state)
-    void testEndpoint({ ...identity, location }, { models: [], timeout: 15000 }).then((report) => {
+    const probe = () => testEndpoint({ ...identity, location }, { models: [], timeout: 15000 })
+    void probe().then(async (report) => {
+      if (report.locationTest?.status !== 401) return
+      // The probe shares the loader's token cache, so a 401 can mean the cached
+      // token was revoked or replaced: drop it and ask once more with a fresh
+      // token before holding requests on a verdict a refresh would fix.
+      tokenProvider(identity).invalidate()
+      report = await probe()
       if (report.locationTest?.status !== 401) return
       state.error = new Error(`The Google model endpoint is not usable for ${identity.project} (${location}); check that the project exists, the Vertex AI API is enabled and the account may use it`)
       const timer = setTimeout(() => { if (tested.get(key) === state) tested.delete(key) }, 60000)
@@ -221,6 +228,8 @@ export const GoogleVertexAuthPlugin = async (input = {}, pluginOptions = {}) => 
             const retry = request.clone()
             const response = await fetch(new Request(request, { headers, redirect: "error" }))
             if (response.status !== 401) return response
+            // Free the connection before the retry: this reply is not returned.
+            await response.body?.cancel().catch(() => {})
             getToken.invalidate()
             headers.set("authorization", `Bearer ${await getToken()}`)
             return fetch(new Request(retry, { headers, redirect: "error" }))
