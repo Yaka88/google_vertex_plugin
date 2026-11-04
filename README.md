@@ -6,6 +6,10 @@
 
 You sign in once with your own Google account. No service accounts, no JSON keys, no extra packages: the plugin uses the Chrome you already have.
 
+## Token caching and request latency
+
+With an `authorized_user` ADC, the access token is cached per account until 60 seconds before it expires and refreshed directly against Google's OAuth token endpoint; concurrent callers share one in-flight refresh. In gcloud mode every token still comes from gcloud, unchanged. The endpoint check runs in the background, so it never sits in front of the first model call — only a rejected credential (401) is surfaced on later requests.
+
 ## Requirements
 
 - Google Chrome or Chromium (set `VERTEX_CHROME_PATH` if it is somewhere unusual)
