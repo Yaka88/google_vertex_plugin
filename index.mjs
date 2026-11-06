@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises"
 import { defaultProfile, validateProject } from "./lib/browser.mjs"
 import { resolveIdentity, startLogin, tokenProvider, identityOf } from "./lib/credentials.mjs"
 import { consoleAccountFor, fetchCredits, usageOf } from "./lib/credits.mjs"
+import { hardenRequest } from "./lib/history.mjs"
 import { testEndpoint } from "./lib/endpoint.mjs"
 import { providerModels, seedModels } from "./lib/models.mjs"
 
@@ -215,10 +216,14 @@ export const GoogleVertexAuthPlugin = async (input = {}, pluginOptions = {}) => 
           async fetch(input, init) {
             const probe = tested.get(probeKey)
             if (probe?.error) throw probe.error
-            const request = new Request(input, init)
-            const url = new URL(request.url)
+            const asked = new Request(input, init)
+            const url = new URL(asked.url)
             if (url.origin !== allowed.origin || !url.pathname.startsWith(allowed.pathname + "/")) throw new Error("Refusing to send a Vertex credential outside the configured Google model endpoint")
             if (!geminiRoute(url.pathname, allowed.pathname)) throw new Error("Refusing to send a Vertex credential to a route the Gemini endpoint does not serve")
+            // Gemini's history rules: a conversation ending or opening with
+            // the model's turn, or a tool's response beside the user's words,
+            // is sent in the shape Vertex takes instead of answered 400 (#734)
+            const request = await hardenRequest(asked)
             const headers = new Headers(request.headers)
             headers.delete("x-goog-api-key")
             headers.delete("x-api-key")

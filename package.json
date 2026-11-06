@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-gcp-ai-auth",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Vertex AI models and Google Cloud promotional credits, signed with your own gcloud / ADC login",
   "type": "module",
   "main": "./opencode.mjs",
@@ -18,7 +18,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "check": "node --check index.mjs && node --check lib/browser.mjs && node --check lib/credentials.mjs && node --check lib/credits.mjs && node --check lib/endpoint.mjs && node --check lib/models.mjs && node --check lib/fetch_credits.mjs",
+    "check": "node --check index.mjs && node --check lib/browser.mjs && node --check lib/credentials.mjs && node --check lib/credits.mjs && node --check lib/endpoint.mjs && node --check lib/models.mjs && node --check lib/fetch_credits.mjs && node --check lib/history.mjs",
     "models": "node lib/fetch_credits.mjs models",
     "test": "node --test test/*.test.mjs",
     "credits": "node lib/fetch_credits.mjs credits",
