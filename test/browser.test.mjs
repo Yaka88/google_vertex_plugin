@@ -346,7 +346,7 @@ test("renamed Console emails use a resolved identity or explicit alias and keep 
 // A failed read is remembered, so a project that cannot read its credits does
 // not open a browser on every usage poll: the cache is what stands in for a
 // switch here, since asking again would cost a browser for the same answer.
-test("a failed credit read is cached instead of opening a browser each poll", { timeout: 30000, ...needsBrowser }, async () => {
+test("a failed credit read is cached instead of opening a browser each poll", { timeout: 90000, ...needsBrowser }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "vertex-browser-failure-"))
   const previousCache = process.env.XDG_CACHE_HOME
   let browser
@@ -359,15 +359,21 @@ test("a failed credit read is cached instead of opening a browser each poll", { 
       requests++
       return request.fulfill({ body: "<!doctype html><h1>No credits table here</h1>" })
     })
-    // The scrape gives up on a Console page that has no table rather than
-    // waiting out the page's whole patience.
-    const options = { profile, browser, billingAccount: "AAAAAA-BBBBBB-CCCCCC", scrapeTimeout: 3000 }
+    // The scrape asks a Console page that has no table twice (once more on a
+    // fresh load) and then reports it, rather than waiting out the page's
+    // whole patience.
+    const options = { profile, browser, billingAccount: "AAAAAA-BBBBBB-CCCCCC", scrapeTimeout: 2000 }
     await assert.rejects(fetchCredits(options), /Credits table was not found/)
     const afterFirst = requests
-    assert.ok(afterFirst > 0)
+    assert.ok(afterFirst >= 2, `the page was loaded ${afterFirst} time(s), not twice`)
     // The second poll answers from the remembered failure without a browser.
     await assert.rejects(fetchCredits(options), /Credits table was not found/)
     assert.equal(requests, afterFirst)
+    // A table that may still be loading is a fact about this moment, not the
+    // account: with the short window spent, the next poll tries again while a
+    // failure of the account would stay remembered for twenty minutes.
+    await assert.rejects(fetchCredits({ ...options, transientTtl: 0 }), /Credits table was not found/)
+    assert.ok(requests > afterFirst)
     // Asking again on purpose does try again.
     await assert.rejects(fetchCredits({ ...options, force: true }), /Credits table was not found/)
     assert.ok(requests > afterFirst)
@@ -377,6 +383,29 @@ test("a failed credit read is cached instead of opening a browser each poll", { 
     else process.env.XDG_CACHE_HOME = previousCache
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+test("a credits table that is empty on the first load is read again on the page the Console settled on", { timeout: 60000, ...needsBrowser }, async () => {
+  // The Console sometimes answers with the table's frame and then reloads the
+  // page itself (it adds organizationId=… to the URL while it works out the
+  // billing account's organization). A table read across that reload has no
+  // rows: a fact about the page, not about the account, so the read is asked
+  // for once more before anything is reported.
+  let loads = 0
+  const serve = (url) => {
+    if (!/\/credits\/all$/.test(url.pathname)) return "<html></html>"
+    loads++
+    return loads === 1
+      ? creditsTable([])
+      : creditsTable([["Trial", "Available", "$12.00", "$20.00", "one"]])
+  }
+  await consoleFixture("reload", serve, async ({ profile, browser, paths }) => {
+    const credits = await fetchCredits({ profile, browser, billingAccount: "AAAAAA-BBBBBB-CCCCCC", scrapeTimeout: 2000, force: true })
+    assert.equal(credits.remaining, 12)
+    const read = paths.filter((path) => path !== "/favicon.ico")
+    assert.equal(read.length, 2, read.join(", "))
+    assert.ok(read.every((path) => path === "/billing/AAAAAA-BBBBBB-CCCCCC/credits/all"), read.join(", "))
+  })
 })
 
 // kidchen94's cases (#667), on a Console served from inside the test. Each

@@ -54,7 +54,7 @@ One Chrome window opens. Approve the consent page there and the plugin closes th
 
 ## Credits
 
-Google has no API for promotional credits, so the balance is read from the Cloud Console page. The row opens a browser when it needs a balance, and only then. Balances are cached for five minutes.
+Google has no API for promotional credits, so the balance is read from the Cloud Console page. The row opens a browser when it needs a balance, and only then. Balances are cached for five minutes. The Console sometimes opens the credits page and then reloads it itself while it works out the billing account's organization, so a table that is still empty when it is read is loaded once more before anything is reported. A read that still fails while the page is loading is asked again about a minute later; a failure that is about the account (a lapsed Chrome sign-in, no `billing.viewer`, a credits table in another language) is remembered for twenty minutes, so a usage poll does not open a browser for an answer that cannot change.
 
 ## What it keeps where
 
