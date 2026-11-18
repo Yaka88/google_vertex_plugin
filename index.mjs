@@ -83,6 +83,26 @@ function geminiRoute(pathname, base) {
   return GEMINI_ROUTE.test(pathname.slice(base.length))
 }
 
+// A body the caller already holds. A 401 can send it again without copying.
+// A stream is not one of these: buffering it on the way out would copy every
+// request in case the token was stale, so a 401 on a stream is returned as it is.
+function heldBody(body) {
+  if (typeof body === "string") return true
+  if (body instanceof URLSearchParams) return true
+  if (typeof Blob !== "undefined" && body instanceof Blob) return true
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return true
+  if (typeof FormData !== "undefined" && body instanceof FormData) return true
+  return false
+}
+
+// The body a 401 can send again: the hardened JSON, or the caller's own
+// in-memory body. Undefined means there is nothing cheap to replay.
+function replayBody(init, hardened) {
+  if (hardened !== undefined) return hardened
+  if (init && Object.prototype.hasOwnProperty.call(init, "body") && heldBody(init.body)) return init.body
+  return undefined
+}
+
 // A probe is remembered for the process, but only a credential refusal blocks
 // requests. That verdict expires so a later load can retry recovered credentials.
 const tested = new Map()
@@ -223,21 +243,30 @@ export const GoogleVertexAuthPlugin = async (input = {}, pluginOptions = {}) => 
             // Gemini's history rules: a conversation ending or opening with
             // the model's turn, or a tool's response beside the user's words,
             // is sent in the shape Vertex takes instead of answered 400 (#734)
-            const request = await hardenRequest(asked)
+            const { request, body: hardened } = await hardenRequest(asked)
             const headers = new Headers(request.headers)
             headers.delete("x-goog-api-key")
             headers.delete("x-api-key")
             headers.set("authorization", `Bearer ${await getToken()}`)
             headers.set("x-goog-user-project", identity.project)
-            // Keep the body available if Vertex rejects a cached credential.
-            const retry = request.clone()
-            const response = await fetch(new Request(request, { headers, redirect: "error" }))
+            // Replay a body that is already in memory. Do not clone the request
+            // up front: that buffers every body on the chance of a 401. A stream
+            // cannot be sent twice, so a 401 on one is returned as it is.
+            const retryBody = replayBody(init, hardened)
+            const canRetry = retryBody !== undefined || request.body == null
+            const send = (body) => body === undefined
+              ? fetch(new Request(request, { headers, redirect: "error" }))
+              : fetch(new Request(request.url, { method: request.method, headers, body, redirect: "error", signal: request.signal }))
+            const response = await send()
             if (response.status !== 401) return response
+            if (!canRetry) {
+              getToken.invalidate()
+              return response
+            }
             // Free the connection before the retry: this reply is not returned.
             await response.body?.cancel().catch(() => {})
-            getToken.invalidate()
-            headers.set("authorization", `Bearer ${await getToken()}`)
-            return fetch(new Request(retry, { headers, redirect: "error" }))
+            headers.set("authorization", `Bearer ${await getToken.refresh()}`)
+            return send(retryBody)
           },
         }
       },

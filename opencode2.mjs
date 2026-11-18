@@ -85,8 +85,10 @@ export function fieldsOf(prompts) {
     if (p.placeholder) f.placeholder = String(p.placeholder)
     if (p.type === "select" && Array.isArray(p.options))
       f.options = p.options.map((o) => ({ value: String(o.value), label: String(o.label ?? o.value), ...(o.hint ? { description: String(o.hint) } : {}) }))
-    // a prompt shown only when another answer says so can't be required
-    if (!p.condition) f.required = true
+    // a prompt shown only when another answer says so can't be required, and
+    // neither can one whose own validate() accepts an empty answer (the
+    // browser sign-in's optional API key)
+    if (!p.condition && p.required !== false) f.required = true
     out.push(f)
   }
   return out.length ? out : undefined
@@ -573,7 +575,31 @@ async function setupPlugin(ctx, fn, live) {
         }
       } catch {}
     })()
-  void refresh()
+  // A plugin still reading its list in the background when the first read
+  // returned (agy-cli: `agy models` and a session probe take seconds, and
+  // the first read gets its static list) says so through
+  // provider.warming(): the list is read once more when that ends, once,
+  // and no later than a minute on.
+  const warmed = async () => {
+    let w
+    try {
+      w = typeof hooks.provider?.warming === "function" ? hooks.provider.warming() : null
+    } catch {
+      return
+    }
+    if (!w || typeof w.then !== "function") return
+    let timer
+    await Promise.race([
+      Promise.resolve(w).catch(() => {}),
+      new Promise((r) => {
+        timer = setTimeout(r, 60_000)
+        timer.unref?.()
+      }),
+    ])
+    clearTimeout(timer)
+    if (live.on) await refresh()
+  }
+  void refresh().then(warmed, () => {})
 }
 
 export async function setup(ctx, mod = v1) {
