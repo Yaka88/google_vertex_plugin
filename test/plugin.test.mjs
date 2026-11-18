@@ -59,6 +59,31 @@ test("credits sum active rows, deduplicate IDs, reject future/expired rows, and 
   assert.match(usage.windows[0].display, /\$12\.07 remaining/)
 })
 
+test("a trial account counts its welcome credit but not a monthly benefit; a paid account counts both", () => {
+  const named = (id, name, remaining, original = "$10.00", status = "Available") => {
+    const cells = row(id, remaining, original, status)
+    cells[0] = name
+    return cells
+  }
+  const welcome = (status = "Available") => named("FreeTrial:Credit-AAAAAA-BBBBBB-CCCCCC", "Welcome credit", status === "Available" ? "$300.00" : "$0.00", "$300.00", status)
+  const monthly = named("abc-CREDIT_TYPE_MONTHLY-def", "Google Developer Program premium benefit - CREDIT_TYPE_MONTHLY", "$10.00")
+  const trial = parseCreditTables([{ headers, rows: [welcome(), monthly] }], { now })
+  assert.equal(trial.billingStatus, "trial")
+  assert.equal(trial.remaining, 300)
+  assert.equal(trial.original, 300)
+  assert.equal(trial.welcomeCredit, 300)
+  assert.equal(trial.monthlyCredit, 0)
+  assert.equal(trial.credits.find((credit) => /^FreeTrial:/.test(credit.id)).kind, "welcome")
+  assert.equal(trial.credits.find((credit) => /CREDIT_TYPE_MONTHLY/.test(credit.id)).kind, "monthly")
+  // An upgraded account has its welcome credit converted (FreeTrialUpgrade:)
+  // and counts the monthly benefit alongside whatever else it has.
+  const paid = parseCreditTables([{ headers, rows: [welcome("Expired"), row("FreeTrialUpgrade:CreditId-FreeTrial:Credit-AAAAAA-BBBBBB-CCCCCC", "$0.00", "$300.00", "Expired"), monthly] }], { now })
+  assert.equal(paid.billingStatus, "paid")
+  assert.equal(paid.remaining, 10)
+  assert.equal(paid.welcomeCredit, 0)
+  assert.equal(paid.monthlyCredit, 10)
+})
+
 test("Used credits count as fully spent and never increase eligible balance", () => {
   for (const status of ["Used", "used", "Exhausted", "Used up"]) {
     const result = parseCreditTables([{ headers, rows: [row("active", "$2.07"), row("spent", "$1.00", "$10.00", status)] }], { now })

@@ -6,9 +6,21 @@
 
 You sign in once with your own Google account. No service accounts, no JSON keys, no extra packages: the plugin uses the Chrome you already have.
 
-## Token caching and request latency
+## Source and history
 
-With an `authorized_user` ADC, the access token is cached per account until 60 seconds before it expires and refreshed directly against Google's OAuth token endpoint; concurrent callers share one in-flight refresh. In gcloud mode every token still comes from gcloud, unchanged. The endpoint check runs in the background, so it never sits in front of the first model call — only a rejected credential (401) is surfaced on later requests.
+The plugin's development history is at [github.com/Yaka88/google_vertex_plugin](https://github.com/Yaka88/google_vertex_plugin); releases are served from this repository.
+
+- **0.2.4** — The credits page is read again after the Console reloads it, and a trial account counts its welcome credit but not a monthly benefit.
+- **0.2.3** — A Linux zombie process no longer holds the plugin's profile lock.
+- **0.2.2** — A 401 is retried with a fresh token without buffering every response body.
+- **0.2.1** — Gemini's history rules are sent before Vertex, so a request ending with a model turn no longer fails with a 400.
+- **0.2.0** — The access token is cached per account and the endpoint check runs in the background.
+- **0.1.6** — A sign-in with no email stops with a clear error, and a leftover 0.1.1 staging directory is not taken for an account.
+- **0.1.5** — Credits are read per Chrome profile and from each project's own billing account, in yen, and a translated Console is reported.
+- **0.1.4** — A sign-in that waited on a lock its holder had just released takes it, instead of failing with `ENOENT`.
+- **0.1.3** — The plugin loads on OpenCode 2.x through a default `{ id, setup }` export.
+- **0.1.2** — Accounts follow Google's stable `sub`, so a renamed email keeps its sign-in.
+- **0.1.1** — On Windows the sign-in reaches gcloud through its own `gcloud.cmd` path, and an expiring credit can still be spent.
 
 ## Requirements
 
@@ -54,7 +66,7 @@ One Chrome window opens. Approve the consent page there and the plugin closes th
 
 ## Credits
 
-Google has no API for promotional credits, so the balance is read from the Cloud Console page. The row opens a browser when it needs a balance, and only then. Balances are cached for five minutes. The Console sometimes opens the credits page and then reloads it itself while it works out the billing account's organization, so a table that is still empty when it is read is loaded once more before anything is reported. A read that still fails while the page is loading is asked again about a minute later; a failure that is about the account (a lapsed Chrome sign-in, no `billing.viewer`, a credits table in another language) is remembered for twenty minutes, so a usage poll does not open a browser for an answer that cannot change.
+Google has no API for promotional credits, so the balance is read from the Cloud Console page. The row opens a browser when it needs a balance, and only then. Balances are cached for five minutes.
 
 ## What it keeps where
 
@@ -135,7 +147,7 @@ These go in the `gcp-ai` provider's `options` or the plugin's options (the provi
 | `VERTEX_CHROME_GAP` | `0` seconds between one process closing Chrome and the next opening the profile |
 | `VERTEX_CREDITS_CACHE_TTL` | `300` seconds |
 | `VERTEX_CREDITS_FAILURE_TTL` | `1200` seconds |
-| `VERTEX_CREDITS_TRANSIENT_TTL` | `60` seconds, for network failures |
+| `VERTEX_CREDITS_TRANSIENT_TTL` | `60` seconds, for a read that failed while the page was still loading |
 | `VERTEX_MODELS_CACHE_TTL` | `21600` seconds (6 hours) |
 
 A machine-wide `CLOUDSDK_CONFIG` is never read. It would point every account at one ADC, and a sign-in there would overwrite credentials the plugin didn't write; the plugin only uses its own `<config>/gcp-ai/adc-<account>` directories.
@@ -143,7 +155,3 @@ A machine-wide `CLOUDSDK_CONFIG` is never read. It would point every account at 
 ## Privacy
 
 The plugin asks Google for your model list with your credentials, sends inference requests to the Vertex endpoint, and opens Cloud Console in a Chrome it started to read your credits. No third-party server, no credential upload, no debugging port.
-
-## Source and history
-
-The plugin's development history is at [github.com/Yaka88/google_vertex_plugin](https://github.com/Yaka88/google_vertex_plugin); releases are served from this repository.
